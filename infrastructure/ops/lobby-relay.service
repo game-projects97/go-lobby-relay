@@ -1,0 +1,43 @@
+[Unit]
+Description=Go lobby and UDP relay server
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/lobby-relay/traffic-stopped
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=lobby-relay
+Group=lobby-relay
+WorkingDirectory=/opt/lobby-relay/current
+EnvironmentFile=/etc/lobby-relay/server.env
+EnvironmentFile=/etc/lobby-relay/traffic.env
+# Public UDP bypasses the Tunnel, so the relay itself is gated on transfer accounting.
+ExecStartPre=+/opt/lobby-relay/ops/check-traffic-budget.sh --check-start
+# Operator HTTP stays on loopback; player HTTP is reached only through the Tunnel.
+ExecStart=/opt/lobby-relay/current/lobby-relay --management-listen 127.0.0.1:8081 --player-listen 127.0.0.1:8080 --relay-network udp4 --relay-listen 0.0.0.0:${RELAY_UDP_PORT} --advertised-host ${RELAY_ADVERTISED_HOST} --advertised-port ${RELAY_UDP_PORT} --operator-token-file /etc/lobby-relay/operator-token
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=128
+LimitNOFILE=4096
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

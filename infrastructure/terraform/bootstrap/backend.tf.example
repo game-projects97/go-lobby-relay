@@ -1,0 +1,9 @@
+# Copy to backend.tf ONLY after first local bootstrap apply and secure state backup.
+terraform {
+  backend "s3" {
+    key          = "lobby-relay/bootstrap.tfstate"
+    region       = "ap-northeast-2"
+    encrypt      = true
+    use_lockfile = true
+  }
+}

@@ -1,0 +1,17 @@
+[Unit]
+Description=Lobby relay conservative monthly transfer guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-/etc/lobby-relay/traffic.env
+ExecStart=/opt/lobby-relay/ops/check-traffic-budget.sh
+TimeoutStartSec=60
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/lobby-relay /run/systemd/system

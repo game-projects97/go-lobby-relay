@@ -8,3 +8,13 @@ unity/RelaySample/Logs/
 unity/RelaySample/Temp/
 unity/RelaySample/UserSettings/
 unity/RelaySample/obj/
+
+# Terraform working data and populated inputs: state, plans and variables may hold credentials.
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+*.tfbackend
+__pycache__/

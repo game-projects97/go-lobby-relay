@@ -1,0 +1,96 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lobby-relay-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    environment: production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Expose the toolchain at the repository tool path used by tests
+        run: |
+          mkdir -p .tools/go/bin
+          ln -s "$(go env GOROOT)/bin/go" .tools/go/bin/go
+      - name: Validate nonsecret deployment settings
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+        run: |
+          umask 077
+          python3 - <<'PY'
+          import os, pathlib, re
+          host=os.environ['DEPLOY_HOST']
+          if not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?',host) or '.' not in host:
+              raise SystemExit('Verified deploy DNS hostname required')
+          if not re.fullmatch(r'[0-9a-f]{40}',os.environ['GITHUB_SHA']):
+              raise SystemExit('Full commit SHA required')
+          (pathlib.Path(os.environ['RUNNER_TEMP'])/'lobby-relay-deploy').mkdir(mode=0o700)
+          PY
+      - name: Test and build Linux release
+        run: |
+          go test -race ./...
+          go vet ./...
+          infrastructure/scripts/package-release.sh "$RUNNER_TEMP/lobby-relay-deploy/release.tar.gz"
+          tar -xzf "$RUNNER_TEMP/lobby-relay-deploy/release.tar.gz" -C "$RUNNER_TEMP/lobby-relay-deploy" cloudflared
+      - name: Configure verified SSH endpoint
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          umask 077
+          python3 - <<'PY'
+          import os, pathlib, shlex
+          directory=pathlib.Path(os.environ['RUNNER_TEMP'])/'lobby-relay-deploy'
+          key=os.environ['SSH_PRIVATE_KEY']; known=os.environ['SSH_KNOWN_HOSTS']
+          if not key.strip() or not known.strip(): raise SystemExit('Private deploy key and verified known_hosts required')
+          (directory/'id').write_text(key.rstrip()+'\n')
+          (directory/'known_hosts').write_text(known.rstrip()+'\n')
+          (directory/'ssh_config').write_text('\n'.join([
+              'Host lobby-relay-deploy',
+              '  HostName '+os.environ['DEPLOY_HOST'],
+              '  User ubuntu',
+              '  IdentityFile '+str(directory/'id'),
+              '  UserKnownHostsFile '+str(directory/'known_hosts'),
+              '  StrictHostKeyChecking yes',
+              '  IdentitiesOnly yes',
+              '  BatchMode yes',
+              '  ConnectTimeout 20',
+              '  ServerAliveInterval 15',
+              '  ServerAliveCountMax 10',
+              '  ProxyCommand '+shlex.quote(str(directory/'cloudflared'))+' access ssh --hostname %h',
+              '',
+          ]))
+          PY
+      - name: Deploy through Access and SSH
+        env:
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.TUNNEL_SERVICE_TOKEN_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.TUNNEL_SERVICE_TOKEN_SECRET }}
+        run: |
+          test -n "$TUNNEL_SERVICE_TOKEN_ID" && test -n "$TUNNEL_SERVICE_TOKEN_SECRET"
+          ssh -F "$RUNNER_TEMP/lobby-relay-deploy/ssh_config" lobby-relay-deploy "install -d -m 0700 /home/ubuntu/lobby-relay-deploy/$GITHUB_SHA"
+          scp -F "$RUNNER_TEMP/lobby-relay-deploy/ssh_config" "$RUNNER_TEMP/lobby-relay-deploy/release.tar.gz" infrastructure/scripts/deploy-backend.sh "lobby-relay-deploy:/home/ubuntu/lobby-relay-deploy/$GITHUB_SHA/"
+          ssh -F "$RUNNER_TEMP/lobby-relay-deploy/ssh_config" lobby-relay-deploy "sudo bash /home/ubuntu/lobby-relay-deploy/$GITHUB_SHA/deploy-backend.sh /home/ubuntu/lobby-relay-deploy/$GITHUB_SHA/release.tar.gz $GITHUB_SHA"
+          # Do not restart cloudflared here: it carries this deployment connection.
+      - name: Remove local credentials and package
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/lobby-relay-deploy"
