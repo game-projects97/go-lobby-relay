@@ -1,7 +1,6 @@
 package store
 
 import (
-	"context"
 	"errors"
 	"io"
 	"net/netip"
@@ -12,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gyungsubLee/go-lobby-relay/internal/clock"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
 )
 
@@ -206,13 +206,13 @@ func TestCreateRoomSamplesClockAfterAcquiringStoreLock(t *testing.T) {
 	limits := DefaultLimits()
 	random := newScriptedReader()
 	var store *Store
-	now := func() ClockReading {
+	now := func() clock.Reading {
 		if store.mu.TryLock() {
 			store.mu.Unlock()
 			// A pre-lock sample can become this stale while waiting behind a CSPRNG read.
-			return ClockReading{Wall: testWall, Mono: 0}
+			return clock.Reading{Wall: testWall, Mono: 0}
 		}
-		return ClockReading{Wall: testWall.Add(2 * time.Hour), Mono: 2 * time.Hour}
+		return clock.Reading{Wall: testWall.Add(2 * time.Hour), Mono: 2 * time.Hour}
 	}
 	var err error
 	store, err = New(Config{Limits: limits, Now: now, Random: random})
@@ -230,12 +230,12 @@ func TestCreateRoomSamplesClockAfterAcquiringStoreLock(t *testing.T) {
 }
 
 func TestCreateRoomCanonicalRetryAndDeepCopies(t *testing.T) {
-	clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 10 * time.Second}}
+	fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 10 * time.Second}}
 	random := newScriptedReader(
 		filled(0x11, 16), filled(0x21, 32),
 		filled(0x12, 16), filled(0x22, 32),
 	)
-	store := newTestStore(t, DefaultLimits(), clock, random)
+	store := newTestStore(t, DefaultLimits(), fakeClock, random)
 
 	definition := RoomDefinition{
 		Capacity:  2,
@@ -264,8 +264,8 @@ func TestCreateRoomCanonicalRetryAndDeepCopies(t *testing.T) {
 	assertGrant(t, allocation.Grants[0], "alice", "session-a", bytes16(0x11), bytes32(0x21), testWall.Add(time.Hour), GrantStateIssued)
 	assertGrant(t, allocation.Grants[1], "bob", "session-b", bytes16(0x12), bytes32(0x22), testWall.Add(90*time.Minute), GrantStateIssued)
 	assertReads(t, random.calls, 16, 32, 16, 32)
-	if clock.calls != 1 {
-		t.Fatalf("clock calls = %d, want 1", clock.calls)
+	if fakeClock.calls != 1 {
+		t.Fatalf("clock calls = %d, want 1", fakeClock.calls)
 	}
 
 	definition.Participants[0].ParticipantID = "mutated-input"
@@ -302,8 +302,8 @@ func TestCreateRoomCanonicalRetryAndDeepCopies(t *testing.T) {
 	assertGrant(t, retry.Grants[0], "alice", "session-a", bytes16(0x11), bytes32(0x21), testWall.Add(time.Hour), GrantStateIssued)
 	assertGrant(t, retry.Grants[1], "bob", "session-b", bytes16(0x12), bytes32(0x22), testWall.Add(90*time.Minute), GrantStateIssued)
 	assertReads(t, random.calls, 16, 32, 16, 32)
-	if clock.calls != 2 {
-		t.Fatalf("clock calls after retry = %d, want 2", clock.calls)
+	if fakeClock.calls != 2 {
+		t.Fatalf("clock calls after retry = %d, want 2", fakeClock.calls)
 	}
 	assertStoreCounts(t, store, 1, 2, 1, 2)
 }
@@ -342,9 +342,9 @@ func TestCreateRoomValidatesDefinitionsBeforeRandomness(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: time.Second}}
+			fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: time.Second}}
 			random := newScriptedReader()
-			store := newTestStore(t, tt.limits, clock, random)
+			store := newTestStore(t, tt.limits, fakeClock, random)
 			definition := cloneDefinition(valid)
 			tt.change(&definition)
 
@@ -370,14 +370,14 @@ func TestCreateRoomAcceptsIdentifierAndCapacityBoundaries(t *testing.T) {
 	limits.MaxRoomRecords = 2
 	limits.MaxRoomCapacity = 2
 	limits.MaxActiveSessions = 4
-	clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
+	fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
 	random := newScriptedReader(
 		filled(0x01, 16), filled(0x11, 32),
 		filled(0x02, 16), filled(0x12, 32),
 		filled(0x03, 16), filled(0x13, 32),
 		filled(0x04, 16), filled(0x14, 32),
 	)
-	store := newTestStore(t, limits, clock, random)
+	store := newTestStore(t, limits, fakeClock, random)
 	boundaryID := strings.Repeat("a", protocol.MaxIDBytes)
 	definition := RoomDefinition{
 		Capacity:  2,
@@ -423,9 +423,9 @@ func TestCreateRoomTTLBoundaries(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 37 * time.Second}}
+			fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 37 * time.Second}}
 			random := newScriptedReader(filled(0x51, 16), filled(0x61, 32))
-			store := newTestStore(t, tt.limits, clock, random)
+			store := newTestStore(t, tt.limits, fakeClock, random)
 			definition := RoomDefinition{
 				Capacity:  1,
 				ExpiresAt: tt.roomExpiry,
@@ -463,12 +463,12 @@ func TestCreateRoomConflictsPrecedeCapacityAndRandomness(t *testing.T) {
 	limits.MaxRoomRecords = 1
 	limits.MaxRoomCapacity = 2
 	limits.MaxActiveSessions = 2
-	clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: time.Minute}}
+	fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: time.Minute}}
 	random := newScriptedReader(
 		filled(0x71, 16), filled(0x81, 32),
 		filled(0x72, 16), filled(0x82, 32),
 	)
-	store := newTestStore(t, limits, clock, random)
+	store := newTestStore(t, limits, fakeClock, random)
 	base := validDefinition(testWall, 2)
 	if _, created, err := store.CreateRoom("room", base); err != nil || !created {
 		t.Fatalf("initial CreateRoom() = (_, %t, %v)", created, err)
@@ -545,12 +545,12 @@ func TestCreateRoomEnforcesConfiguredCapsBeforeRandomness(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
+			fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
 			random := newScriptedReader(
 				filled(0x91, 16), filled(0xa1, 32),
 				filled(0x92, 16), filled(0xa2, 32),
 			)
-			store := newTestStore(t, tt.limits, clock, random)
+			store := newTestStore(t, tt.limits, fakeClock, random)
 			for index, definition := range tt.fill {
 				if _, created, err := store.CreateRoom("room-"+string(rune('a'+index)), definition); err != nil || !created {
 					t.Fatalf("fill %d = (_, %t, %v), want created", index, created, err)
@@ -569,12 +569,12 @@ func TestCreateRoomEnforcesConfiguredCapsBeforeRandomness(t *testing.T) {
 }
 
 func TestCreateRoomRetryUsesStoredMonotonicDeadlines(t *testing.T) {
-	clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 100 * time.Second}}
+	fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 100 * time.Second}}
 	random := newScriptedReader(
 		filled(0xb1, 16), filled(0xc1, 32),
 		filled(0xb2, 16), filled(0xc2, 32),
 	)
-	store := newTestStore(t, DefaultLimits(), clock, random)
+	store := newTestStore(t, DefaultLimits(), fakeClock, random)
 	definition := RoomDefinition{
 		Capacity:  2,
 		ExpiresAt: testWall.Add(2 * time.Hour),
@@ -589,7 +589,7 @@ func TestCreateRoomRetryUsesStoredMonotonicDeadlines(t *testing.T) {
 	}
 	initialCalls := len(random.calls)
 
-	clock.reading = ClockReading{Wall: testWall.Add(10 * time.Hour), Mono: 100*time.Second + 30*time.Minute}
+	fakeClock.reading = clock.Reading{Wall: testWall.Add(10 * time.Hour), Mono: 100*time.Second + 30*time.Minute}
 	retry, created, err := store.CreateRoom("room", definition)
 	if err != nil || created {
 		t.Fatalf("forward-wall retry = (_, %t, %v), want existing", created, err)
@@ -598,7 +598,7 @@ func TestCreateRoomRetryUsesStoredMonotonicDeadlines(t *testing.T) {
 		t.Fatalf("forward wall step changed live grant: %#v", retry.Grants[0])
 	}
 
-	clock.reading = ClockReading{Wall: testWall.Add(-10 * time.Hour), Mono: 100*time.Second + time.Hour}
+	fakeClock.reading = clock.Reading{Wall: testWall.Add(-10 * time.Hour), Mono: 100*time.Second + time.Hour}
 	retry, created, err = store.CreateRoom("room", definition)
 	if err != nil || created {
 		t.Fatalf("exact grant-deadline retry = (_, %t, %v), want existing", created, err)
@@ -613,20 +613,20 @@ func TestCreateRoomRetryUsesStoredMonotonicDeadlines(t *testing.T) {
 	if len(random.calls) != initialCalls {
 		t.Fatalf("deadline retries used randomness: calls=%v", random.calls)
 	}
-	if clock.calls != 3 {
-		t.Fatalf("clock calls = %d, want one per operation", clock.calls)
+	if fakeClock.calls != 3 {
+		t.Fatalf("clock calls = %d, want one per operation", fakeClock.calls)
 	}
 	assertStoreCounts(t, store, 1, 2, 1, 2)
 }
 
 func TestCreateRoomRetriesGrantIDCollisions(t *testing.T) {
 	t.Run("same batch", func(t *testing.T) {
-		clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
+		fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
 		random := newScriptedReader(
 			filled(0xd1, 16), filled(0xe1, 32),
 			filled(0xd1, 16), filled(0xd2, 16), filled(0xe2, 32),
 		)
-		store := newTestStore(t, DefaultLimits(), clock, random)
+		store := newTestStore(t, DefaultLimits(), fakeClock, random)
 		allocation, created, err := store.CreateRoom("room", validDefinition(testWall, 2))
 		if err != nil || !created {
 			t.Fatalf("CreateRoom() = (_, %t, %v)", created, err)
@@ -639,12 +639,12 @@ func TestCreateRoomRetriesGrantIDCollisions(t *testing.T) {
 	})
 
 	t.Run("existing index", func(t *testing.T) {
-		clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
+		fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
 		random := newScriptedReader(
 			filled(0xd1, 16), filled(0xe1, 32),
 			filled(0xd1, 16), filled(0xd2, 16), filled(0xe2, 32),
 		)
-		store := newTestStore(t, DefaultLimits(), clock, random)
+		store := newTestStore(t, DefaultLimits(), fakeClock, random)
 		first, _, err := store.CreateRoom("room-a", validDefinition(testWall, 1))
 		if err != nil {
 			t.Fatalf("first CreateRoom(): %v", err)
@@ -666,9 +666,9 @@ func TestCreateRoomRetriesGrantIDCollisions(t *testing.T) {
 			chunks = append(chunks, filled(0xd1, 16))
 		}
 		chunks = append(chunks, filled(0xd2, 16), filled(0xe2, 32))
-		clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
+		fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
 		random := newScriptedReader(chunks...)
-		store := newTestStore(t, DefaultLimits(), clock, random)
+		store := newTestStore(t, DefaultLimits(), fakeClock, random)
 		if _, _, err := store.CreateRoom("room-a", validDefinition(testWall, 1)); err != nil {
 			t.Fatalf("seed CreateRoom(): %v", err)
 		}
@@ -689,9 +689,9 @@ func TestCreateRoomRetriesGrantIDCollisions(t *testing.T) {
 		for range 9 {
 			chunks = append(chunks, filled(0xd1, 16))
 		}
-		clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
+		fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
 		random := newScriptedReader(chunks...)
-		store := newTestStore(t, DefaultLimits(), clock, random)
+		store := newTestStore(t, DefaultLimits(), fakeClock, random)
 		if _, _, err := store.CreateRoom("room-a", validDefinition(testWall, 1)); err != nil {
 			t.Fatalf("seed CreateRoom(): %v", err)
 		}
@@ -724,11 +724,11 @@ func TestCreateRoomRandomReadFailuresRollbackAtomically(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
+			fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
 			random := newScriptedReader(tt.chunks...)
 			random.failAt = tt.failAt
 			random.failure = boom
-			store := newTestStore(t, DefaultLimits(), clock, random)
+			store := newTestStore(t, DefaultLimits(), fakeClock, random)
 			definition := validDefinition(testWall, 2)
 
 			if _, created, err := store.CreateRoom("room", definition); !errors.Is(err, ErrFatalRandom) || created {
@@ -758,12 +758,12 @@ func TestCreateRoomRandomReadFailuresRollbackAtomically(t *testing.T) {
 
 func TestGetRoomReturnsSecretFreeImmutableMonotonicSnapshots(t *testing.T) {
 	baseMono := 100 * time.Second
-	clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: baseMono}}
+	fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: baseMono}}
 	random := newScriptedReader(
 		filled(0x11, 16), filled(0x21, 32),
 		filled(0x12, 16), filled(0x22, 32),
 	)
-	store := newTestStore(t, DefaultLimits(), clock, random)
+	store := newTestStore(t, DefaultLimits(), fakeClock, random)
 	definition := RoomDefinition{
 		Capacity:  2,
 		ExpiresAt: testWall.Add(2 * time.Hour),
@@ -802,12 +802,12 @@ func TestGetRoomReturnsSecretFreeImmutableMonotonicSnapshots(t *testing.T) {
 		t.Fatalf("snapshot shares mutable storage: %#v", second)
 	}
 
-	clock.reading = ClockReading{Wall: testWall.Add(24 * time.Hour), Mono: baseMono + 30*time.Minute}
+	fakeClock.reading = clock.Reading{Wall: testWall.Add(24 * time.Hour), Mono: baseMono + 30*time.Minute}
 	if _, err := store.GetRoom("room"); err != nil {
 		t.Fatalf("forward wall jump ended monotonic room: %v", err)
 	}
 
-	clock.reading = ClockReading{Wall: testWall.Add(-24 * time.Hour), Mono: baseMono + time.Hour}
+	fakeClock.reading = clock.Reading{Wall: testWall.Add(-24 * time.Hour), Mono: baseMono + time.Hour}
 	partial, err := store.GetRoom("room")
 	if err != nil {
 		t.Fatalf("partial-expiry GetRoom(): %v", err)
@@ -828,11 +828,11 @@ func TestGetRoomReturnsSecretFreeImmutableMonotonicSnapshots(t *testing.T) {
 		t.Fatalf("Get/retry used randomness: calls=%v", random.calls)
 	}
 
-	clock.reading = ClockReading{Wall: testWall.Add(48 * time.Hour), Mono: baseMono + 90*time.Minute - time.Nanosecond}
+	fakeClock.reading = clock.Reading{Wall: testWall.Add(48 * time.Hour), Mono: baseMono + 90*time.Minute - time.Nanosecond}
 	if _, err := store.GetRoom("room"); err != nil {
 		t.Fatalf("GetRoom(final deadline - 1ns): %v", err)
 	}
-	clock.reading = ClockReading{Wall: testWall.Add(-48 * time.Hour), Mono: baseMono + 90*time.Minute}
+	fakeClock.reading = clock.Reading{Wall: testWall.Add(-48 * time.Hour), Mono: baseMono + 90*time.Minute}
 	if _, err := store.GetRoom("room"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetRoom(final deadline) error = %v, want ErrNotFound", err)
 	}
@@ -847,9 +847,9 @@ func TestGetRoomReturnsSecretFreeImmutableMonotonicSnapshots(t *testing.T) {
 
 func TestGetRoomDeniesExactRoomDeadlineDespiteWallJumps(t *testing.T) {
 	baseMono := 7 * time.Second
-	clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: baseMono}}
+	fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: baseMono}}
 	random := newScriptedReader(filled(0x31, 16), filled(0x41, 32))
-	store := newTestStore(t, DefaultLimits(), clock, random)
+	store := newTestStore(t, DefaultLimits(), fakeClock, random)
 	definition := RoomDefinition{
 		Capacity:  1,
 		ExpiresAt: testWall.Add(time.Hour),
@@ -862,11 +862,11 @@ func TestGetRoomDeniesExactRoomDeadlineDespiteWallJumps(t *testing.T) {
 	if _, _, err := store.CreateRoom("room", definition); err != nil {
 		t.Fatalf("CreateRoom(): %v", err)
 	}
-	clock.reading = ClockReading{Wall: testWall.Add(24 * time.Hour), Mono: baseMono + time.Hour - time.Nanosecond}
+	fakeClock.reading = clock.Reading{Wall: testWall.Add(24 * time.Hour), Mono: baseMono + time.Hour - time.Nanosecond}
 	if _, err := store.GetRoom("room"); err != nil {
 		t.Fatalf("GetRoom(room deadline - 1ns): %v", err)
 	}
-	clock.reading = ClockReading{Wall: testWall.Add(-24 * time.Hour), Mono: baseMono + time.Hour}
+	fakeClock.reading = clock.Reading{Wall: testWall.Add(-24 * time.Hour), Mono: baseMono + time.Hour}
 	if _, err := store.GetRoom("room"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetRoom(room deadline) error = %v, want ErrNotFound", err)
 	}
@@ -881,12 +881,12 @@ func TestGetRoomDeniesExactRoomDeadlineDespiteWallJumps(t *testing.T) {
 
 func TestEndRoomRevokesKnownRoomAndIsIdempotent(t *testing.T) {
 	limits := DefaultLimits()
-	clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 50 * time.Second}}
+	fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 50 * time.Second}}
 	random := newScriptedReader(
 		filled(0x51, 16), filled(0x61, 32),
 		filled(0x52, 16), filled(0x62, 32),
 	)
-	store := newTestStore(t, limits, clock, random)
+	store := newTestStore(t, limits, fakeClock, random)
 	definition := validDefinition(testWall, 2)
 	if _, _, err := store.CreateRoom("room", definition); err != nil {
 		t.Fatalf("CreateRoom(): %v", err)
@@ -917,7 +917,7 @@ func TestEndRoomRevokesKnownRoomAndIsIdempotent(t *testing.T) {
 		t.Fatalf("tombstone conflict used randomness: calls=%v", random.calls)
 	}
 
-	clock.reading.Mono++
+	fakeClock.reading.Mono++
 	if err := store.EndRoom("room"); err != nil {
 		t.Fatalf("repeated EndRoom(): %v", err)
 	}
@@ -928,7 +928,7 @@ func TestEndRoomRevokesKnownRoomAndIsIdempotent(t *testing.T) {
 	}
 	assertStoreCounts(t, store, 1, 0, 0, 0)
 
-	clock.reading.Mono = wantDeadline
+	fakeClock.reading.Mono = wantDeadline
 	if err := store.EndRoom("room"); err != nil {
 		t.Fatalf("EndRoom(stale tombstone): %v", err)
 	}
@@ -938,12 +938,12 @@ func TestEndRoomRevokesKnownRoomAndIsIdempotent(t *testing.T) {
 func TestExpireReleasesPartialAndFinalGrantAccountingExactlyOnce(t *testing.T) {
 	limits := DefaultLimits()
 	baseMono := 10 * time.Second
-	clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: baseMono}}
+	fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: baseMono}}
 	random := newScriptedReader(
 		filled(0x71, 16), filled(0x81, 32),
 		filled(0x72, 16), filled(0x82, 32),
 	)
-	store := newTestStore(t, limits, clock, random)
+	store := newTestStore(t, limits, fakeClock, random)
 	definition := RoomDefinition{
 		Capacity:  2,
 		ExpiresAt: testWall.Add(2 * time.Hour),
@@ -961,11 +961,11 @@ func TestExpireReleasesPartialAndFinalGrantAccountingExactlyOnce(t *testing.T) {
 	bob := store.roomsByID["room"].grants[1]
 	store.mu.RUnlock()
 
-	clock.reading.Mono = baseMono + time.Hour - time.Nanosecond
+	fakeClock.reading.Mono = baseMono + time.Hour - time.Nanosecond
 	store.Expire()
 	assertStoreCounts(t, store, 1, 2, 1, 2)
 
-	clock.reading.Mono = baseMono + time.Hour
+	fakeClock.reading.Mono = baseMono + time.Hour
 	store.Expire()
 	if alice.state != GrantStateExpired || alice.secret != nil || bob.state != GrantStateIssued || bob.secret == nil {
 		t.Fatalf("partial expiry state = alice:%#v bob:%#v", alice, bob)
@@ -987,7 +987,7 @@ func TestExpireReleasesPartialAndFinalGrantAccountingExactlyOnce(t *testing.T) {
 	assertStoreCounts(t, store, 1, 1, 1, 1)
 
 	finalDeadline := baseMono + 90*time.Minute
-	clock.reading.Mono = finalDeadline
+	fakeClock.reading.Mono = finalDeadline
 	if _, err := store.GetRoom("room"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetRoom(final grant deadline) error = %v, want ErrNotFound", err)
 	}
@@ -996,7 +996,7 @@ func TestExpireReleasesPartialAndFinalGrantAccountingExactlyOnce(t *testing.T) {
 	}
 	assertStoreCounts(t, store, 1, 1, 1, 1)
 
-	clock.reading.Mono = finalDeadline + 2*time.Second
+	fakeClock.reading.Mono = finalDeadline + 2*time.Second
 	store.Expire()
 	if bob.state != GrantStateExpired || bob.secret != nil {
 		t.Fatalf("final grant was not cleared: %#v", bob)
@@ -1007,10 +1007,10 @@ func TestExpireReleasesPartialAndFinalGrantAccountingExactlyOnce(t *testing.T) {
 	assertStoreCounts(t, store, 1, 0, 0, 0)
 
 	emptyDeadline := finalDeadline + limits.EmptyGrace
-	clock.reading.Mono = emptyDeadline - time.Nanosecond
+	fakeClock.reading.Mono = emptyDeadline - time.Nanosecond
 	store.Expire()
 	assertRoomState(t, store, "room", roomStateEmpty)
-	clock.reading.Mono = emptyDeadline
+	fakeClock.reading.Mono = emptyDeadline
 	store.Expire()
 	assertTombstoneOnly(t, store, "room", emptyDeadline+limits.TombstoneTTL)
 	assertStoreCounts(t, store, 1, 0, 0, 0)
@@ -1034,9 +1034,9 @@ func TestExpireUsesEarlierRoomTTLOrAnchoredEmptyGrace(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			limits := DefaultLimits()
 			limits.EmptyGrace = tt.emptyGrace
-			clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
+			fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
 			random := newScriptedReader(filled(0x91, 16), filled(0xa1, 32))
-			store := newTestStore(t, limits, clock, random)
+			store := newTestStore(t, limits, fakeClock, random)
 			definition := RoomDefinition{
 				Capacity:  1,
 				ExpiresAt: testWall.Add(tt.roomTTL),
@@ -1050,15 +1050,15 @@ func TestExpireUsesEarlierRoomTTLOrAnchoredEmptyGrace(t *testing.T) {
 				t.Fatalf("CreateRoom(): %v", err)
 			}
 
-			clock.reading.Mono = tt.grantTTL
+			fakeClock.reading.Mono = tt.grantTTL
 			store.Expire()
 			if tt.grantTTL < tt.roomTTL {
 				assertRoomState(t, store, "room", roomStateEmpty)
 			}
-			clock.reading.Mono = tt.physicalDeadline - time.Nanosecond
+			fakeClock.reading.Mono = tt.physicalDeadline - time.Nanosecond
 			store.Expire()
 			assertRoomState(t, store, "room", roomStateEmpty)
-			clock.reading.Mono = tt.physicalDeadline
+			fakeClock.reading.Mono = tt.physicalDeadline
 			store.Expire()
 			assertTombstoneOnly(t, store, "room", tt.physicalDeadline+limits.TombstoneTTL)
 			assertStoreCounts(t, store, 1, 0, 0, 0)
@@ -1066,8 +1066,8 @@ func TestExpireUsesEarlierRoomTTLOrAnchoredEmptyGrace(t *testing.T) {
 	}
 
 	t.Run("room and grant exact deadline", func(t *testing.T) {
-		clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
-		store := newTestStore(t, DefaultLimits(), clock, newScriptedReader(filled(0xb1, 16), filled(0xc1, 32)))
+		fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
+		store := newTestStore(t, DefaultLimits(), fakeClock, newScriptedReader(filled(0xb1, 16), filled(0xc1, 32)))
 		definition := RoomDefinition{
 			Capacity:  1,
 			ExpiresAt: testWall.Add(10 * time.Second),
@@ -1080,10 +1080,10 @@ func TestExpireUsesEarlierRoomTTLOrAnchoredEmptyGrace(t *testing.T) {
 		if _, _, err := store.CreateRoom("room", definition); err != nil {
 			t.Fatalf("CreateRoom(): %v", err)
 		}
-		clock.reading.Mono = 10*time.Second - time.Nanosecond
+		fakeClock.reading.Mono = 10*time.Second - time.Nanosecond
 		store.Expire()
 		assertRoomState(t, store, "room", roomStateOpen)
-		clock.reading.Mono = 10 * time.Second
+		fakeClock.reading.Mono = 10 * time.Second
 		store.Expire()
 		assertTombstoneOnly(t, store, "room", 10*time.Second+HardMaxTombstoneTTL)
 	})
@@ -1096,9 +1096,9 @@ func TestTombstoneDeadlineAllowsExactSameIDRecreationWithoutRefresh(t *testing.T
 	limits.MaxRoomCapacity = 1
 	limits.MaxActiveSessions = 1
 	limits.TombstoneTTL = 3 * time.Second
-	clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
+	fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
 	random := &sequenceReader{}
-	store := newTestStore(t, limits, clock, random)
+	store := newTestStore(t, limits, fakeClock, random)
 	definition := validDefinition(testWall, 1)
 	first, _, err := store.CreateRoom("room", definition)
 	if err != nil {
@@ -1111,7 +1111,7 @@ func TestTombstoneDeadlineAllowsExactSameIDRecreationWithoutRefresh(t *testing.T
 	assertTombstoneOnly(t, store, "room", deadline)
 	reads := random.reads
 
-	clock.reading.Mono = deadline - time.Nanosecond
+	fakeClock.reading.Mono = deadline - time.Nanosecond
 	store.Expire()
 	if err := store.EndRoom("room"); err != nil {
 		t.Fatalf("repeated EndRoom(): %v", err)
@@ -1124,7 +1124,7 @@ func TestTombstoneDeadlineAllowsExactSameIDRecreationWithoutRefresh(t *testing.T
 		t.Fatalf("live tombstone used randomness: reads=%d want=%d", random.reads, reads)
 	}
 
-	clock.reading.Mono = deadline
+	fakeClock.reading.Mono = deadline
 	second, created, err := store.CreateRoom("room", definition)
 	if err != nil || !created {
 		t.Fatalf("CreateRoom(exact tombstone deadline) = (_, %t, %v), want created", created, err)
@@ -1138,10 +1138,10 @@ func TestTombstoneDeadlineAllowsExactSameIDRecreationWithoutRefresh(t *testing.T
 		t.Fatalf("EndRoom(recreated): %v", err)
 	}
 	secondDeadline := deadline + limits.TombstoneTTL
-	clock.reading.Mono = secondDeadline - time.Nanosecond
+	fakeClock.reading.Mono = secondDeadline - time.Nanosecond
 	store.Expire()
 	assertTombstoneOnly(t, store, "room", secondDeadline)
-	clock.reading.Mono = secondDeadline
+	fakeClock.reading.Mono = secondDeadline
 	store.Expire()
 	assertStoreCounts(t, store, 0, 0, 0, 0)
 }
@@ -1154,9 +1154,9 @@ func TestResidentRecordCapIncludesTerminalEmptyAndTombstoneStates(t *testing.T) 
 	limits.MaxActiveSessions = 2
 	limits.EmptyGrace = 5 * time.Second
 	limits.TombstoneTTL = 10 * time.Second
-	clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
+	fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
 	random := &sequenceReader{}
-	store := newTestStore(t, limits, clock, random)
+	store := newTestStore(t, limits, fakeClock, random)
 	definition := RoomDefinition{
 		Capacity:  1,
 		ExpiresAt: testWall.Add(time.Minute),
@@ -1173,7 +1173,7 @@ func TestResidentRecordCapIncludesTerminalEmptyAndTombstoneStates(t *testing.T) 
 	}
 	assertStoreCounts(t, store, 2, 2, 2, 2)
 
-	clock.reading.Mono = 10 * time.Second
+	fakeClock.reading.Mono = 10 * time.Second
 	if _, _, err := store.CreateRoom("room-c", definition); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("new room with terminal pre-sweep records error = %v, want ErrCapacity", err)
 	}
@@ -1194,7 +1194,7 @@ func TestResidentRecordCapIncludesTerminalEmptyAndTombstoneStates(t *testing.T) 
 		t.Fatalf("new room with tombstone resident error = %v, want ErrCapacity", err)
 	}
 
-	clock.reading.Mono = 20 * time.Second
+	fakeClock.reading.Mono = 20 * time.Second
 	store.Expire()
 	assertTombstoneOnly(t, store, "room-a", 30*time.Second)
 	if _, created, err := store.CreateRoom("room-c", definition); err != nil || !created {
@@ -1206,21 +1206,21 @@ func TestResidentRecordCapIncludesTerminalEmptyAndTombstoneStates(t *testing.T) 
 
 func TestLifecycleChurnReturnsAllStateToBaseline(t *testing.T) {
 	limits := DefaultLimits()
-	clock := &manualClock{}
+	fakeClock := &manualClock{}
 	random := &sequenceReader{}
-	store := newTestStore(t, limits, clock, random)
+	store := newTestStore(t, limits, fakeClock, random)
 	globalIngressPackets, globalIngressBytes := store.authenticatedGlobalPackets, store.authenticatedGlobalBytes
 	globalFanoutWrites, globalFanoutBytes := store.globalFanoutWrites, store.globalFanoutBytes
 	for index := range 1000 {
 		base := time.Duration(index) * (limits.TombstoneTTL + 2*time.Nanosecond)
-		clock.reading = ClockReading{Wall: testWall.Add(base), Mono: base}
+		fakeClock.reading = clock.Reading{Wall: testWall.Add(base), Mono: base}
 		definition := RoomDefinition{
 			Capacity:  1,
-			ExpiresAt: clock.reading.Wall.Add(time.Nanosecond),
+			ExpiresAt: fakeClock.reading.Wall.Add(time.Nanosecond),
 			Participants: []ParticipantDefinition{{
 				ParticipantID:  "participant",
 				SessionID:      "session",
-				GrantExpiresAt: clock.reading.Wall.Add(time.Nanosecond),
+				GrantExpiresAt: fakeClock.reading.Wall.Add(time.Nanosecond),
 			}},
 		}
 		allocation, created, err := store.CreateRoom("room", definition)
@@ -1263,13 +1263,13 @@ func TestLifecycleChurnReturnsAllStateToBaseline(t *testing.T) {
 		if reason != RejectNone || len(plan.Recipients) != 0 {
 			t.Fatalf("cycle %d AdmitFanout() = (%#v, %q)", index, plan, reason)
 		}
-		clock.reading.Mono += time.Nanosecond
+		fakeClock.reading.Mono += time.Nanosecond
 		store.Expire()
 		if grant.ingressPackets != nil || grant.ingressBytes != nil || room.ingressPackets != nil ||
 			room.ingressBytes != nil || room.fanoutWrites != nil || room.fanoutBytes != nil {
 			t.Fatalf("cycle %d terminal cleanup retained limiter state", index)
 		}
-		clock.reading.Mono += limits.TombstoneTTL
+		fakeClock.reading.Mono += limits.TombstoneTTL
 		store.Expire()
 		assertStoreCounts(t, store, 0, 0, 0, 0)
 		if len(store.preauthSources) != 0 {
@@ -1286,58 +1286,10 @@ func TestLifecycleChurnReturnsAllStateToBaseline(t *testing.T) {
 	assertStoreInvariants(t, store)
 }
 
-func TestRunSweeperUsesConfiguredIntervalAndStopsOnCancellation(t *testing.T) {
-	limits := DefaultLimits()
-	limits.SweepInterval = time.Millisecond
-	clock := &signalClock{
-		reading: ClockReading{Wall: testWall, Mono: 0},
-		called:  make(chan struct{}, 1),
-	}
-	store, err := New(Config{Limits: limits, Now: clock.now, Random: &sequenceReader{}})
-	if err != nil {
-		t.Fatalf("New(): %v", err)
-	}
-	definition := RoomDefinition{
-		Capacity:  1,
-		ExpiresAt: testWall.Add(time.Nanosecond),
-		Participants: []ParticipantDefinition{{
-			ParticipantID:  "participant",
-			SessionID:      "session",
-			GrantExpiresAt: testWall.Add(time.Nanosecond),
-		}},
-	}
-	if _, _, err := store.CreateRoom("room", definition); err != nil {
-		t.Fatalf("CreateRoom(): %v", err)
-	}
-	<-clock.called
-	clock.reading = ClockReading{Wall: testWall.Add(-time.Hour), Mono: time.Nanosecond}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		store.RunSweeper(ctx)
-		close(done)
-	}()
-	select {
-	case <-clock.called:
-	case <-time.After(time.Second):
-		cancel()
-		t.Fatal("RunSweeper did not call Expire within configured lower interval")
-	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("RunSweeper did not stop after cancellation")
-	}
-	assertTombstoneOnly(t, store, "room", time.Nanosecond+limits.TombstoneTTL)
-	assertStoreInvariants(t, store)
-}
-
 func TestConcurrentLifecycleMaintainsLinearizedState(t *testing.T) {
 	t.Run("identical allocation", func(t *testing.T) {
-		clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
-		store := newTestStore(t, DefaultLimits(), clock, &sequenceReader{})
+		fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
+		store := newTestStore(t, DefaultLimits(), fakeClock, &sequenceReader{})
 		definition := validDefinition(testWall, 1)
 		type result struct {
 			allocation Allocation
@@ -1380,8 +1332,8 @@ func TestConcurrentLifecycleMaintainsLinearizedState(t *testing.T) {
 	})
 
 	t.Run("create get end expire race", func(t *testing.T) {
-		clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
-		store := newTestStore(t, DefaultLimits(), clock, &sequenceReader{})
+		fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
+		store := newTestStore(t, DefaultLimits(), fakeClock, &sequenceReader{})
 		definition := validDefinition(testWall, 1)
 		if _, _, err := store.CreateRoom("room", definition); err != nil {
 			t.Fatalf("CreateRoom(): %v", err)
@@ -1440,8 +1392,8 @@ func TestConcurrentLifecycleMaintainsLinearizedState(t *testing.T) {
 		limits.MaxRoomRecords = 4
 		limits.MaxRoomCapacity = 1
 		limits.MaxActiveSessions = 4
-		clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
-		store := newTestStore(t, limits, clock, &sequenceReader{})
+		fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
+		store := newTestStore(t, limits, fakeClock, &sequenceReader{})
 		definition := validDefinition(testWall, 1)
 		results := make(chan error, 32)
 		var wait sync.WaitGroup
@@ -1501,16 +1453,16 @@ func (reader *sequenceReader) Read(buffer []byte) (int, error) {
 }
 
 type signalClock struct {
-	reading ClockReading
+	reading clock.Reading
 	called  chan struct{}
 }
 
-func (clock *signalClock) now() ClockReading {
+func (fakeClock *signalClock) now() clock.Reading {
 	select {
-	case clock.called <- struct{}{}:
+	case fakeClock.called <- struct{}{}:
 	default:
 	}
-	return clock.reading
+	return fakeClock.reading
 }
 
 func assertSnapshotParticipant(
@@ -1687,15 +1639,15 @@ func assertStoreInvariants(t *testing.T, store *Store) {
 
 type manualClock struct {
 	mu      sync.Mutex
-	reading ClockReading
+	reading clock.Reading
 	calls   int
 }
 
-func (clock *manualClock) now() ClockReading {
-	clock.mu.Lock()
-	defer clock.mu.Unlock()
-	clock.calls++
-	return clock.reading
+func (fakeClock *manualClock) now() clock.Reading {
+	fakeClock.mu.Lock()
+	defer fakeClock.mu.Unlock()
+	fakeClock.calls++
+	return fakeClock.reading
 }
 
 type scriptedReader struct {
@@ -1735,9 +1687,9 @@ func (reader *scriptedReader) Read(buffer []byte) (int, error) {
 	return read, nil
 }
 
-func newTestStore(t *testing.T, limits Limits, clock *manualClock, random io.Reader) *Store {
+func newTestStore(t *testing.T, limits Limits, fakeClock *manualClock, random io.Reader) *Store {
 	t.Helper()
-	store, err := New(Config{Limits: limits, Now: clock.now, Random: random})
+	store, err := New(Config{Limits: limits, Now: fakeClock.now, Random: random})
 	if err != nil {
 		t.Fatalf("New(): %v", err)
 	}

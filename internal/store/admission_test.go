@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gyungsubLee/go-lobby-relay/internal/clock"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
 	"golang.org/x/time/rate"
 )
@@ -290,7 +291,7 @@ func TestChallengeExactDeadlineAndTerminalGrantPaths(t *testing.T) {
 		if reason != RejectNone {
 			t.Fatalf("BeginChallenge(): %q", reason)
 		}
-		fixture.clock.reading = ClockReading{Wall: testWall.Add(3 * time.Second), Mono: 3 * time.Second}
+		fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(3 * time.Second), Mono: 3 * time.Second}
 		if _, reason := fixture.store.Authenticate(fixture.authRequest(0, challenge, bytes16(0x33), endpoint)); reason != RejectExpired {
 			t.Fatalf("Authenticate(exact challenge deadline) reason = %q", reason)
 		}
@@ -303,7 +304,7 @@ func TestChallengeExactDeadlineAndTerminalGrantPaths(t *testing.T) {
 
 	t.Run("grant deadline", func(t *testing.T) {
 		fixture := newHandshakeFixture(t, time.Hour, 2*time.Second, 1)
-		fixture.clock.reading = ClockReading{Wall: testWall.Add(2 * time.Second), Mono: 2 * time.Second}
+		fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(2 * time.Second), Mono: 2 * time.Second}
 		if _, reason := fixture.store.BeginChallenge(fixture.challengeRequest(0, bytes16(1), netip.MustParseAddrPort("192.0.2.12:4000"))); reason != RejectExpired {
 			t.Fatalf("BeginChallenge(exact grant deadline) reason = %q", reason)
 		}
@@ -659,7 +660,7 @@ func TestGetRoomProjectsBindingAndPendingDeadlinesBeforeSweep(t *testing.T) {
 			{name: "exact", at: 60 * time.Second, want: BindingStateExpired},
 			{name: "after", at: 60*time.Second + time.Nanosecond, want: BindingStateExpired},
 		} {
-			fixture.clock.reading = ClockReading{Wall: testWall.Add(tt.at), Mono: tt.at}
+			fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(tt.at), Mono: tt.at}
 			snapshot, err := fixture.store.GetRoom("room")
 			if err != nil || snapshot.Participants[0].BindingState != tt.want {
 				t.Fatalf("GetRoom(%s) = (%#v, %v), want binding %q", tt.name, snapshot, err, tt.want)
@@ -705,7 +706,7 @@ func TestGetRoomProjectsBindingAndPendingDeadlinesBeforeSweep(t *testing.T) {
 			{name: "exact", at: 3 * time.Second, want: BindingStateBound},
 			{name: "after", at: 3*time.Second + time.Nanosecond, want: BindingStateBound},
 		} {
-			fixture.clock.reading = ClockReading{Wall: testWall.Add(tt.at), Mono: tt.at}
+			fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(tt.at), Mono: tt.at}
 			snapshot, err := fixture.store.GetRoom("room")
 			if err != nil || snapshot.Participants[0].BindingState != tt.want || snapshot.Participants[0].GrantState != GrantStateBound {
 				t.Fatalf("GetRoom(%s) = (%#v, %v), want bound/%q", tt.name, snapshot, err, tt.want)
@@ -741,7 +742,7 @@ func TestIdempotentCreateRoomProjectsBindingDeadlineBeforeSweep(t *testing.T) {
 		{name: "exact", at: 60 * time.Second, want: GrantStateIssued},
 		{name: "after", at: 60*time.Second + time.Nanosecond, want: GrantStateIssued},
 	} {
-		fixture.clock.reading = ClockReading{Wall: testWall.Add(tt.at), Mono: tt.at}
+		fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(tt.at), Mono: tt.at}
 		allocation, created, err := fixture.store.CreateRoom("room", definition)
 		if err != nil || created || allocation.Grants[0].State != tt.want || allocation.Grants[0].GrantSecret == nil {
 			t.Fatalf("CreateRoom(%s) = (%#v, %t, %v), want state %q with live secret", tt.name, allocation, created, err, tt.want)
@@ -763,14 +764,14 @@ func TestExpiredBindingRemainsExpiredWithLivePendingRebind(t *testing.T) {
 	}
 	oldBinding := fixture.grant(0).binding
 
-	fixture.clock.reading = ClockReading{Wall: testWall.Add(time.Second), Mono: time.Second}
+	fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(time.Second), Mono: time.Second}
 	fixture.random.reset(filled(0xf1, 16), filled(0xf2, 32))
 	newChallenge, reason := fixture.store.BeginChallenge(fixture.challengeRequest(0, newNonce, newEndpoint))
 	if reason != RejectNone {
 		t.Fatalf("rebind BeginChallenge(): %q", reason)
 	}
 	pending := fixture.grant(0).pending
-	fixture.clock.reading = ClockReading{Wall: testWall.Add(2 * time.Second), Mono: 2 * time.Second}
+	fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(2 * time.Second), Mono: 2 * time.Second}
 	before, err := fixture.store.GetRoom("room")
 	if err != nil || before.Participants[0].GrantState != GrantStateIssued || before.Participants[0].BindingState != BindingStateExpired {
 		t.Fatalf("pre-sweep snapshot = (%#v, %v), want issued/expired", before, err)
@@ -806,11 +807,11 @@ func TestRecentCompletionExpiresExactlyAtChallengeTTL(t *testing.T) {
 	if reason != RejectNone {
 		t.Fatalf("Authenticate(): %q", reason)
 	}
-	fixture.clock.reading = ClockReading{Wall: testWall.Add(3*time.Second - time.Nanosecond), Mono: 3*time.Second - time.Nanosecond}
+	fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(3*time.Second - time.Nanosecond), Mono: 3*time.Second - time.Nanosecond}
 	if duplicate, reason := fixture.store.Authenticate(auth); reason != RejectNone || duplicate != bound {
 		t.Fatalf("duplicate before recent deadline = (%#v, %q)", duplicate, reason)
 	}
-	fixture.clock.reading = ClockReading{Wall: testWall.Add(3 * time.Second), Mono: 3 * time.Second}
+	fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(3 * time.Second), Mono: 3 * time.Second}
 	if _, reason := fixture.store.Authenticate(auth); reason != RejectExpired {
 		t.Fatalf("duplicate at recent deadline reason = %q", reason)
 	}
@@ -832,7 +833,7 @@ func TestDuplicateAuthAtBindingDeadlineClearsCurrentAuthority(t *testing.T) {
 		t.Fatalf("Authenticate(): %q", reason)
 	}
 	binding := fixture.grant(0).binding
-	fixture.clock.reading = ClockReading{Wall: testWall.Add(2 * time.Second), Mono: 2 * time.Second}
+	fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(2 * time.Second), Mono: 2 * time.Second}
 	if _, reason := fixture.store.Authenticate(auth); reason != RejectExpired {
 		t.Fatalf("duplicate at binding deadline reason = %q", reason)
 	}
@@ -918,7 +919,7 @@ func TestClientIngressInvalidClassesUsePreauthExactlyOnce(t *testing.T) {
 		}},
 		{"bad HMAC", RejectAuthFailed, func(_ *relayStoreFixture, _ *boundTestClient, r *ClientDataRequest) { r.AuthTag[0] ^= 1 }},
 		{"expired", RejectExpired, func(f *relayStoreFixture, c *boundTestClient, _ *ClientDataRequest) {
-			f.store.bindingsByID[c.bindingID].binding.deadline = f.clock.reading.Mono
+			f.store.bindingsByID[c.bindingID].binding.deadline = f.fakeClock.reading.Mono
 		}},
 		{"revoked", RejectNotBound, func(f *relayStoreFixture, c *boundTestClient, _ *ClientDataRequest) { _ = f.store.EndRoom(c.roomID) }},
 	}
@@ -928,7 +929,7 @@ func TestClientIngressInvalidClassesUsePreauthExactlyOnce(t *testing.T) {
 			client := fixture.addBoundRoom(t, "room", 1, 1)[0]
 			request := client.dataRequest(1, []byte("payload"))
 			tt.edit(fixture, &client, &request)
-			now := limiterTime(fixture.clock.reading.Mono)
+			now := limiterTime(fixture.fakeClock.reading.Mono)
 			source := fixture.store.preauthSources[sourceKey(request.Endpoint)]
 			if source == nil {
 				t.Fatal("classification endpoint unexpectedly has no canonical source record")
@@ -1031,7 +1032,7 @@ func TestFailedHelloAndAuthChargeOnlyPreauthOnce(t *testing.T) {
 				call = func() RejectReason { _, reason := fixture.store.Authenticate(request); return reason }
 			}
 
-			now := limiterTime(fixture.clock.reading.Mono)
+			now := limiterTime(fixture.fakeClock.reading.Mono)
 			source := fixture.store.preauthSources[sourceKey(endpoint)]
 			preBefore := preauthBalancesAt(fixture.store, source, now)
 			authBefore := authenticatedBalancesAt(fixture.store, grant, now)
@@ -1107,7 +1108,7 @@ func TestRateLimitedHelloAndAuthDoNotMutateChallengeOrBinding(t *testing.T) {
 			if reason := fixture.store.AdmitPreauth(PreauthRequest{Endpoint: client.endpoint, InputBytes: 1}); reason != RejectNone {
 				t.Fatalf("exhaust preauth source: %q", reason)
 			}
-			now := limiterTime(fixture.clock.reading.Mono)
+			now := limiterTime(fixture.fakeClock.reading.Mono)
 			source := fixture.store.preauthSources[sourceKey(client.endpoint)]
 			preBefore := preauthBalancesAt(fixture.store, source, now)
 			authBefore := authenticatedBalancesAt(fixture.store, grant, now)
@@ -1623,8 +1624,8 @@ func TestPreauthSourceKeysAndAtomicAdmission(t *testing.T) {
 			t.Fatalf("burst admission reason = %q", reason)
 		}
 	}
-	fixture.clock.reading = ClockReading{Wall: testWall.Add(time.Nanosecond), Mono: time.Nanosecond}
-	now := limiterTime(fixture.clock.reading.Mono)
+	fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(time.Nanosecond), Mono: time.Nanosecond}
+	now := limiterTime(fixture.fakeClock.reading.Mono)
 	globalBefore := fixture.store.preauthGlobalPackets.TokensAt(now)
 	record := fixture.store.preauthSources[sourceKey(v4a)]
 	if reason := fixture.store.AdmitPreauth(PreauthRequest{Endpoint: v4a, InputBytes: 1}); reason != RejectRateLimited {
@@ -1633,7 +1634,7 @@ func TestPreauthSourceKeysAndAtomicAdmission(t *testing.T) {
 	if got := fixture.store.preauthGlobalPackets.TokensAt(now); got != globalBefore {
 		t.Fatalf("source rejection partially consumed global tokens: %v -> %v", globalBefore, got)
 	}
-	if fixture.store.preauthSources[sourceKey(v4a)] != record || record.lastObserved != fixture.clock.reading.Mono {
+	if fixture.store.preauthSources[sourceKey(v4a)] != record || record.lastObserved != fixture.fakeClock.reading.Mono {
 		t.Fatal("rate-limited existing source was recreated or not refreshed")
 	}
 }
@@ -1673,7 +1674,7 @@ func TestPreauthByteBoundariesAreAtomicAcrossAllFourLimiters(t *testing.T) {
 						t.Fatalf("setup packet %d reason = %q", index, reason)
 					}
 				}
-				now := limiterTime(fixture.clock.reading.Mono)
+				now := limiterTime(fixture.fakeClock.reading.Mono)
 				source := fixture.store.preauthSources[sourceKey(endpoint)]
 				before := preauthBalancesAt(fixture.store, source, now)
 				if reason := fixture.store.AdmitPreauth(PreauthRequest{Endpoint: endpoint, InputBytes: tt.finalCost}); reason != tt.want {
@@ -1712,7 +1713,7 @@ func TestPreauthByteBoundariesAreAtomicAcrossAllFourLimiters(t *testing.T) {
 						t.Fatalf("setup packet %d reason = %q", index, reason)
 					}
 				}
-				now := limiterTime(fixture.clock.reading.Mono)
+				now := limiterTime(fixture.fakeClock.reading.Mono)
 				source := fixture.store.preauthSources[sourceKey(target)]
 				before := preauthBalancesAt(fixture.store, source, now)
 				if reason := fixture.store.AdmitPreauth(PreauthRequest{Endpoint: target, InputBytes: tt.finalCost}); reason != tt.want {
@@ -1737,7 +1738,7 @@ func TestHandshakeDeadlinesSaturateNearMaxMonotonicTime(t *testing.T) {
 	now := maxDeadline - 2*time.Second
 	fixture.store.roomsByID["room"].monoDeadline = maxDeadline
 	fixture.grant(0).monoDeadline = maxDeadline
-	fixture.clock.reading = ClockReading{Wall: testWall, Mono: now}
+	fixture.fakeClock.reading = clock.Reading{Wall: testWall, Mono: now}
 	endpoint := netip.MustParseAddrPort("192.0.2.90:9000")
 	nonce := bytes16(0xf9)
 	fixture.random.reset(filled(0xfa, 16), filled(0xfb, 32), filled(0xfc, 16))
@@ -1771,7 +1772,7 @@ func TestPreauthIdleBoundaryLazilyReplacesOnlyAtExactDeadline(t *testing.T) {
 				t.Fatalf("initial admission = %q", reason)
 			}
 			old := fixture.store.preauthSources[sourceKey(endpoint)]
-			fixture.clock.reading = ClockReading{Wall: testWall.Add(tt.at), Mono: tt.at}
+			fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(tt.at), Mono: tt.at}
 			if reason := fixture.store.AdmitPreauth(PreauthRequest{Endpoint: endpoint, InputBytes: 1}); reason != RejectNone {
 				t.Fatalf("boundary admission = %q", reason)
 			}
@@ -1792,7 +1793,7 @@ func TestPreauthRejectedHelloRefreshesExistingSource(t *testing.T) {
 		t.Fatalf("unknown grant reason = %q", reason)
 	}
 	record := fixture.store.preauthSources[sourceKey(endpoint)]
-	fixture.clock.reading = ClockReading{Wall: testWall.Add(time.Second), Mono: time.Second}
+	fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(time.Second), Mono: time.Second}
 	if _, reason := fixture.store.BeginChallenge(request); reason != RejectUnknownGrant {
 		t.Fatalf("second unknown grant reason = %q", reason)
 	}
@@ -1882,17 +1883,17 @@ func TestPreauthFullTableUsesProcessOnlyAndCreatesNoRecord(t *testing.T) {
 			t.Fatalf("fill source %d reason = %q", index, reason)
 		}
 		if index >= fixture.limits.PreauthGlobalPacketBurst-1 {
-			fixture.clock.reading.Mono += time.Second / time.Duration(fixture.limits.PreauthGlobalPacketRate)
-			fixture.clock.reading.Wall = testWall.Add(fixture.clock.reading.Mono)
+			fixture.fakeClock.reading.Mono += time.Second / time.Duration(fixture.limits.PreauthGlobalPacketRate)
+			fixture.fakeClock.reading.Wall = testWall.Add(fixture.fakeClock.reading.Mono)
 		}
 	}
 	if len(fixture.store.preauthSources) != HardMaxPreauthSources {
 		t.Fatalf("source table size = %d", len(fixture.store.preauthSources))
 	}
-	fixture.clock.reading.Mono += time.Second
-	fixture.clock.reading.Wall = testWall.Add(fixture.clock.reading.Mono)
+	fixture.fakeClock.reading.Mono += time.Second
+	fixture.fakeClock.reading.Wall = testWall.Add(fixture.fakeClock.reading.Mono)
 	newEndpoint := netip.MustParseAddrPort("11.0.0.1:1000")
-	now := limiterTime(fixture.clock.reading.Mono)
+	now := limiterTime(fixture.fakeClock.reading.Mono)
 	packetsBefore := fixture.store.preauthGlobalPackets.TokensAt(now)
 	bytesBefore := fixture.store.preauthGlobalBytes.TokensAt(now)
 	if reason := fixture.store.AdmitPreauth(PreauthRequest{Endpoint: newEndpoint, InputBytes: 1_201}); reason != RejectRateLimited {
@@ -1943,12 +1944,12 @@ func TestExpireRemovesIdleSourcesAndBindingAtExactDeadlines(t *testing.T) {
 		t.Fatalf("Authenticate(): %q", reason)
 	}
 	binding := fixture.grant(0).binding
-	fixture.clock.reading = ClockReading{Wall: testWall.Add(60*time.Second - time.Nanosecond), Mono: 60*time.Second - time.Nanosecond}
+	fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(60*time.Second - time.Nanosecond), Mono: 60*time.Second - time.Nanosecond}
 	fixture.store.Expire()
 	if fixture.store.preauthSources[sourceKey(source)] == nil || fixture.store.bindingsByID[bound.BindingID] == nil {
 		t.Fatal("relay state expired before its exact deadline")
 	}
-	fixture.clock.reading = ClockReading{Wall: testWall.Add(60 * time.Second), Mono: 60 * time.Second}
+	fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(60 * time.Second), Mono: 60 * time.Second}
 	fixture.store.Expire()
 	if fixture.store.preauthSources[sourceKey(source)] != nil || fixture.store.bindingsByID[bound.BindingID] != nil ||
 		fixture.grant(0).binding != nil || binding.key != (protocol.Bytes32{}) {
@@ -1979,7 +1980,7 @@ func TestExpireAndEndRoomClearRelaySecretsAndIndexes(t *testing.T) {
 			terminalState: GrantStateExpired,
 			bindingState:  BindingStateExpired,
 			terminate: func(fixture *handshakeFixture) error {
-				fixture.clock.reading = ClockReading{Wall: testWall.Add(time.Second), Mono: time.Second}
+				fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(time.Second), Mono: time.Second}
 				fixture.store.roomsByID["room"].monoDeadline = time.Second
 				fixture.store.Expire()
 				return nil
@@ -2053,7 +2054,7 @@ func TestExpireAndEndRoomClearRelaySecretsAndIndexes(t *testing.T) {
 				len(fixture.store.grantsByID) != 0 || len(fixture.store.bindingsByID) != 0 || len(fixture.store.candidatesByID) != 0 {
 				t.Fatalf("terminal indexes retained grant=%x binding=%x recent=%x pending=%x", grantID, bindingID, recentID, pending.CandidateID)
 			}
-			assertTombstoneOnly(t, fixture.store, "room", fixture.clock.reading.Mono+fixture.limits.TombstoneTTL)
+			assertTombstoneOnly(t, fixture.store, "room", fixture.fakeClock.reading.Mono+fixture.limits.TombstoneTTL)
 			assertStoreInvariants(t, fixture.store)
 		})
 	}
@@ -2093,7 +2094,7 @@ func TestEndRoomClassifiesRetiredRelayCredentialsWithoutResurrection(t *testing.
 
 	assertPreauthCharge := func(name string, endpoint netip.AddrPort, inputBytes int, want RejectReason, call func() RejectReason) {
 		t.Helper()
-		now := limiterTime(fixture.clock.reading.Mono)
+		now := limiterTime(fixture.fakeClock.reading.Mono)
 		source := fixture.store.preauthSources[sourceKey(endpoint)]
 		if source == nil {
 			t.Fatalf("%s source record missing", name)
@@ -2190,7 +2191,7 @@ func TestRelayAuthorityEndsAtExactRoomGrantAndBindingDeadlines(t *testing.T) {
 			}
 			request.AuthTag = protocol.ClientDataTag(key, protocol.Revision, request.RoomID, request.SessionID,
 				request.BindingID, request.Sequence, request.Payload)
-			fixture.clock.reading = ClockReading{Wall: testWall.Add(2 * time.Second), Mono: 2 * time.Second}
+			fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(2 * time.Second), Mono: 2 * time.Second}
 			if _, reason := fixture.store.AdmitClientIngress(request, 1); reason != RejectExpired {
 				t.Fatalf("AdmitClientIngress(exact %s deadline) reason = %q", tt.name, reason)
 			}
@@ -2275,7 +2276,7 @@ func preauthBalancesAt(store *Store, source *preauthSource, now time.Time) preau
 
 type handshakeFixture struct {
 	store      *Store
-	clock      *manualClock
+	fakeClock  *manualClock
 	random     *scriptedReader
 	allocation Allocation
 	secrets    []protocol.Bytes32
@@ -2284,7 +2285,7 @@ type handshakeFixture struct {
 
 func newHandshakeFixture(t *testing.T, roomTTL, grantTTL time.Duration, participants int) *handshakeFixture {
 	t.Helper()
-	clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
+	fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
 	random := newScriptedReader()
 	chunks := make([][]byte, 0, participants*2)
 	secrets := make([]protocol.Bytes32, participants)
@@ -2294,7 +2295,7 @@ func newHandshakeFixture(t *testing.T, roomTTL, grantTTL time.Duration, particip
 	}
 	random.reset(chunks...)
 	limits := DefaultLimits()
-	store := newTestStore(t, limits, clock, random)
+	store := newTestStore(t, limits, fakeClock, random)
 	definition := validDefinition(testWall, participants)
 	definition.ExpiresAt = testWall.Add(roomTTL)
 	for index := range definition.Participants {
@@ -2304,7 +2305,7 @@ func newHandshakeFixture(t *testing.T, roomTTL, grantTTL time.Duration, particip
 	if err != nil {
 		t.Fatalf("CreateRoom(): %v", err)
 	}
-	return &handshakeFixture{store: store, clock: clock, random: random, allocation: allocation, secrets: secrets, limits: limits}
+	return &handshakeFixture{store: store, fakeClock: fakeClock, random: random, allocation: allocation, secrets: secrets, limits: limits}
 }
 
 func (fixture *handshakeFixture) grant(index int) *grantRecord {
@@ -2388,8 +2389,8 @@ func containsFold(value, fragment string) bool {
 
 func newD04Limiter(t *testing.T, pick func(*Store) *rate.Limiter) *rate.Limiter {
 	t.Helper()
-	clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
-	store := newTestStore(t, DefaultLimits(), clock, &sequenceReader{})
+	fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
+	store := newTestStore(t, DefaultLimits(), fakeClock, &sequenceReader{})
 	if _, _, err := store.CreateRoom("room", validDefinition(testWall, 1)); err != nil {
 		t.Fatalf("CreateRoom(): %v", err)
 	}
@@ -2410,9 +2411,9 @@ func testPreauthSource(store *Store) *preauthSource {
 }
 
 type relayStoreFixture struct {
-	store  *Store
-	clock  *manualClock
-	random *sequenceReader
+	store     *Store
+	fakeClock *manualClock
+	random    *sequenceReader
 }
 
 type boundTestClient struct {
@@ -2424,13 +2425,13 @@ type boundTestClient struct {
 
 func newRelayStoreFixture(t *testing.T, limits Limits) *relayStoreFixture {
 	t.Helper()
-	clock := &manualClock{reading: ClockReading{Wall: testWall, Mono: 0}}
+	fakeClock := &manualClock{reading: clock.Reading{Wall: testWall, Mono: 0}}
 	random := &sequenceReader{}
-	return &relayStoreFixture{store: newTestStore(t, limits, clock, random), clock: clock, random: random}
+	return &relayStoreFixture{store: newTestStore(t, limits, fakeClock, random), fakeClock: fakeClock, random: random}
 }
 
 func (fixture *relayStoreFixture) setMono(now time.Duration) {
-	fixture.clock.reading = ClockReading{Wall: testWall.Add(now), Mono: now}
+	fixture.fakeClock.reading = clock.Reading{Wall: testWall.Add(now), Mono: now}
 }
 
 func (fixture *relayStoreFixture) addBoundRoom(t *testing.T, roomID string, participants int, network byte) []boundTestClient {

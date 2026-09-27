@@ -28,7 +28,7 @@ const (
 var errInvalidConfig = errors.New("invalid player API config")
 
 type Config struct {
-	Auth           *playerauth.Auth
+	PlayerTokens   *playerauth.Auth
 	Lobbies        *lobby.Manager
 	AdvertisedHost string
 	AdvertisedPort uint16
@@ -40,7 +40,7 @@ type Config struct {
 }
 
 type handler struct {
-	auth           *playerauth.Auth
+	playerTokens   *playerauth.Auth
 	lobbies        *lobby.Manager
 	advertisedHost string
 	advertisedPort uint16
@@ -51,7 +51,7 @@ type handler struct {
 }
 
 func NewHandler(config Config) (http.Handler, error) {
-	if config.Auth == nil || config.Lobbies == nil || config.AdvertisedHost == "" || config.AdvertisedPort == 0 ||
+	if config.PlayerTokens == nil || config.Lobbies == nil || config.AdvertisedHost == "" || config.AdvertisedPort == 0 ||
 		config.RequestRate <= 0 || config.RequestRate > HardPlayerRequestRate ||
 		config.RequestBurst <= 0 || config.RequestBurst > HardPlayerRequestBurst ||
 		config.MaxConcurrent <= 0 || config.MaxConcurrent > HardPlayerConcurrent {
@@ -62,7 +62,7 @@ func NewHandler(config Config) (http.Handler, error) {
 		now = time.Now
 	}
 	return &handler{
-		auth: config.Auth, lobbies: config.Lobbies,
+		playerTokens: config.PlayerTokens, lobbies: config.Lobbies,
 		advertisedHost: config.AdvertisedHost, advertisedPort: config.AdvertisedPort,
 		limiter:   rate.NewLimiter(config.RequestRate, config.RequestBurst),
 		semaphore: make(chan struct{}, config.MaxConcurrent), now: now, fatal: config.Fatal,
@@ -105,7 +105,7 @@ func (handler *handler) authorize(request *http.Request) (playerauth.Claims, boo
 	if !found {
 		return playerauth.Claims{}, false
 	}
-	claims, err := handler.auth.Verify(token)
+	claims, err := handler.playerTokens.Verify(token)
 	return claims, err == nil
 }
 

@@ -1,39 +1,13 @@
 package lobby
 
 import (
-	"crypto/rand"
-	"encoding/base64"
-	"errors"
-	"io"
 	"math"
 	"sort"
 	"strconv"
-	"sync"
 	"time"
 
+	"github.com/gyungsubLee/go-lobby-relay/internal/clock"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
-	"github.com/gyungsubLee/go-lobby-relay/internal/store"
-)
-
-const (
-	HardMaxOpenLobbies = 256
-	HardMaxMembers     = 16
-	HardMaxLobbyTTL    = 2 * time.Hour
-	HardMaxListPage    = 50
-	DefaultLobbyTTL    = 30 * time.Minute
-	MatchTTL           = 2 * time.Minute
-
-	maxIDDraws = 9
-)
-
-var (
-	ErrInvalid     = errors.New("lobby: invalid")
-	ErrNotFound    = errors.New("lobby: not found")
-	ErrConflict    = errors.New("lobby: conflict")
-	ErrForbidden   = errors.New("lobby: forbidden")
-	ErrCapacity    = errors.New("lobby: capacity")
-	ErrUnavailable = errors.New("lobby: unavailable")
-	ErrFatalRandom = errors.New("lobby: fatal random")
 )
 
 type Visibility string
@@ -50,12 +24,6 @@ const (
 	LobbyStateMatched LobbyState = "matched"
 	LobbyStateClosed  LobbyState = "closed"
 )
-
-type Config struct {
-	Relay  *store.Store
-	Now    func() store.ClockReading
-	Random io.Reader
-}
 
 type CreateRequest struct {
 	Visibility Visibility
@@ -92,28 +60,6 @@ type LobbyPage struct {
 	NextCursor string
 }
 
-type Assignment struct {
-	MatchID, RoomID, PlayerID, SessionID string
-	GrantID                              protocol.Bytes16
-	GrantSecret                          protocol.Bytes32
-	GrantExpiresAt                       time.Time
-}
-
-type Manager struct {
-	mu sync.Mutex
-
-	relay  *store.Store
-	now    func() store.ClockReading
-	random io.Reader
-
-	lobbiesByID     map[string]*lobbyRecord
-	lobbyByPlayer   map[string]string
-	matchIDs        map[string]struct{}
-	ticketsByPlayer map[string]*ticketRecord
-	queues          map[queueKey][]string
-	nextSequence    uint64
-}
-
 type lobbyRecord struct {
 	id, ownerPlayerID, queueKey string
 	visibility                  Visibility
@@ -130,35 +76,6 @@ type memberRecord struct {
 	playerID     string
 	ready        bool
 	joinSequence uint64
-}
-
-func New(config Config) (*Manager, error) {
-	if config.Relay == nil {
-		return nil, ErrInvalid
-	}
-	now := config.Now
-	if now == nil {
-		origin := time.Now()
-		now = func() store.ClockReading {
-			current := time.Now()
-			return store.ClockReading{Wall: current.UTC(), Mono: current.Sub(origin)}
-		}
-	}
-	random := config.Random
-	if random == nil {
-		random = rand.Reader
-	}
-	return &Manager{
-		relay:           config.Relay,
-		now:             now,
-		random:          random,
-		lobbiesByID:     make(map[string]*lobbyRecord),
-		lobbyByPlayer:   make(map[string]string),
-		matchIDs:        make(map[string]struct{}),
-		ticketsByPlayer: make(map[string]*ticketRecord),
-		queues:          make(map[queueKey][]string),
-		nextSequence:    1,
-	}, nil
 }
 
 func (manager *Manager) Create(playerID string, request CreateRequest) (LobbySnapshot, error) {
@@ -185,7 +102,7 @@ func (manager *Manager) Create(playerID string, request CreateRequest) (LobbySna
 	if err != nil {
 		return LobbySnapshot{}, err
 	}
-	deadline, ok := deadlineAfter(reading.Mono, DefaultLobbyTTL)
+	deadline, ok := clock.DeadlineAfter(reading.Mono, DefaultLobbyTTL)
 	if !ok {
 		return LobbySnapshot{}, ErrInvalid
 	}
@@ -382,23 +299,17 @@ func (manager *Manager) Start(playerID, lobbyID string, revision uint64) (Assign
 		return Assignment{}, ErrConflict
 	}
 	players := membersInJoinOrder(record)
-	matchID, _, assignments, expiresAt, deadline, err := manager.allocateMatchLocked(players, reading)
+	match, err := manager.allocateMatchLocked(players, reading)
 	if err != nil {
 		return Assignment{}, err
 	}
 	record.state = LobbyStateMatched
 	record.revision++
-	record.expiresAt = expiresAt
-	record.monoDeadline = deadline
-	record.assignments = assignments
-	manager.matchIDs[matchID] = struct{}{}
-	return assignments[playerID], nil
-}
-
-func (manager *Manager) Expire() {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	manager.expireLocked(manager.now())
+	record.expiresAt = match.expiresAt
+	record.monoDeadline = match.deadline
+	record.assignments = match.assignments
+	manager.matchIDs[match.matchID] = struct{}{}
+	return match.assignments[playerID], nil
 }
 
 func validCreateRequest(request CreateRequest) bool {
@@ -417,120 +328,14 @@ func parseCursor(cursor string) (uint64, error) {
 	return value, nil
 }
 
-func (manager *Manager) takeSequenceLocked() uint64 {
-	sequence := manager.nextSequence
-	manager.nextSequence++
-	return sequence
-}
-
-func (manager *Manager) uniqueIDLocked(prefix string, exists func(string) bool) (string, error) {
-	for range maxIDDraws {
-		candidate, err := manager.drawIDLocked(prefix)
-		if err != nil {
-			return "", err
-		}
-		if !exists(candidate) {
-			return candidate, nil
-		}
-	}
-	return "", ErrFatalRandom
-}
-
-func (manager *Manager) drawIDLocked(prefix string) (string, error) {
-	var raw [16]byte
-	if _, err := io.ReadFull(manager.random, raw[:]); err != nil {
-		return "", ErrFatalRandom
-	}
-	return prefix + base64.RawURLEncoding.EncodeToString(raw[:]), nil
-}
-
-func (manager *Manager) allocateMatchLocked(players []string, reading store.ClockReading) (string, string, map[string]Assignment, time.Time, time.Duration, error) {
-	expiresAt := reading.Wall.UTC().Add(MatchTTL)
-	deadline, ok := deadlineAfter(reading.Mono, MatchTTL)
-	if !ok {
-		return "", "", nil, time.Time{}, 0, ErrUnavailable
-	}
-	for range maxIDDraws {
-		matchID, err := manager.uniqueIDLocked("m-", func(candidate string) bool {
-			_, exists := manager.matchIDs[candidate]
-			return exists
-		})
-		if err != nil {
-			return "", "", nil, time.Time{}, 0, err
-		}
-		roomID, err := manager.drawIDLocked("r-")
-		if err != nil {
-			return "", "", nil, time.Time{}, 0, err
-		}
-		participants := make([]store.ParticipantDefinition, len(players))
-		sessions := make(map[string]struct{}, len(players))
-		validAttempt := true
-		for index, player := range players {
-			sessionID, sessionErr := manager.uniqueIDLocked("s-", func(candidate string) bool {
-				_, exists := sessions[candidate]
-				return exists
-			})
-			if sessionErr != nil {
-				return "", "", nil, time.Time{}, 0, sessionErr
-			}
-			if _, duplicate := sessions[sessionID]; duplicate {
-				validAttempt = false
-				break
-			}
-			sessions[sessionID] = struct{}{}
-			participants[index] = store.ParticipantDefinition{ParticipantID: player, SessionID: sessionID, GrantExpiresAt: expiresAt}
-		}
-		if !validAttempt {
-			continue
-		}
-		allocation, created, allocationErr := manager.relay.CreateRoom(roomID, store.RoomDefinition{
-			Capacity: uint32(len(players)), ExpiresAt: expiresAt, Participants: participants,
-		})
-		if errors.Is(allocationErr, store.ErrConflict) || allocationErr == nil && !created {
-			continue
-		}
-		if allocationErr != nil {
-			return "", "", nil, time.Time{}, 0, mapStoreError(allocationErr)
-		}
-		assignments := make(map[string]Assignment, len(players))
-		for _, grant := range allocation.Grants {
-			if grant.GrantSecret == nil {
-				_ = manager.relay.EndRoom(roomID)
-				return "", "", nil, time.Time{}, 0, ErrUnavailable
-			}
-			assignments[grant.ParticipantID] = Assignment{
-				MatchID: matchID, RoomID: roomID, PlayerID: grant.ParticipantID, SessionID: grant.SessionID,
-				GrantID: grant.GrantID, GrantSecret: *grant.GrantSecret, GrantExpiresAt: grant.GrantExpiresAt,
-			}
-		}
-		if len(assignments) != len(players) {
-			_ = manager.relay.EndRoom(roomID)
-			return "", "", nil, time.Time{}, 0, ErrUnavailable
-		}
-		return matchID, roomID, assignments, expiresAt, deadline, nil
-	}
-	return "", "", nil, time.Time{}, 0, ErrFatalRandom
-}
-
-func mapStoreError(err error) error {
-	switch {
-	case errors.Is(err, store.ErrFatalRandom):
-		return ErrFatalRandom
-	case errors.Is(err, store.ErrCapacity):
-		return ErrUnavailable
-	default:
-		return ErrUnavailable
-	}
-}
-
-func (manager *Manager) expireLocked(reading store.ClockReading) {
+func (manager *Manager) expireLobbiesLocked(reading clock.Reading) {
 	// ponytail: bounded M1 maps are scanned once; add deadline heaps only if profiling proves this too costly.
 	for lobbyID, record := range manager.lobbiesByID {
 		if reading.Mono < record.monoDeadline {
 			continue
 		}
 		if record.state == LobbyStateMatched && len(record.assignments) != 0 {
-			_ = manager.relay.EndRoom(firstAssignment(record.assignments).RoomID)
+			_ = manager.rooms.EndRoom(firstAssignment(record.assignments).RoomID)
 			delete(manager.matchIDs, firstAssignment(record.assignments).MatchID)
 		}
 		for playerID := range record.members {
@@ -538,14 +343,6 @@ func (manager *Manager) expireLocked(reading store.ClockReading) {
 		}
 		delete(manager.lobbiesByID, lobbyID)
 	}
-	manager.expireTicketsLocked(reading)
-}
-
-func deadlineAfter(now, ttl time.Duration) (time.Duration, bool) {
-	if ttl <= 0 || now > time.Duration(math.MaxInt64)-ttl {
-		return 0, false
-	}
-	return now + ttl, true
 }
 
 func resetReady(record *lobbyRecord) {
@@ -606,11 +403,4 @@ func summaryFor(record *lobbyRecord) LobbySummary {
 		Visibility: record.visibility, Capacity: record.capacity, MemberCount: uint32(len(record.members)),
 		Revision: record.revision, ExpiresAt: record.expiresAt,
 	}
-}
-
-func firstAssignment(assignments map[string]Assignment) Assignment {
-	for _, assignment := range assignments {
-		return assignment
-	}
-	return Assignment{}
 }

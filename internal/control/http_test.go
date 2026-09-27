@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gyungsubLee/go-lobby-relay/internal/clock"
 	"github.com/gyungsubLee/go-lobby-relay/internal/playerauth"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
 	"github.com/gyungsubLee/go-lobby-relay/internal/store"
@@ -412,7 +413,7 @@ func TestRoomHTTPResponsesAreExactIdempotentAndRedacted(t *testing.T) {
 		t.Fatalf("canonical retry changed allocation/randomness: first=%#v retry=%#v reads=%d/%d", first, retry, reads, random.readCount())
 	}
 
-	fixture.clock.setMono(time.Hour)
+	fixture.fakeClock.setMono(time.Hour)
 	partialRecorder := serveHandler(t, fixture.handler, http.MethodPut, "/v1/rooms/room", bytes.NewReader(body), controlBearer, "application/json")
 	if partialRecorder.Code != http.StatusOK {
 		t.Fatalf("partial retry = %d %q", partialRecorder.Code, partialRecorder.Body.String())
@@ -468,7 +469,7 @@ func TestTerminalAndMissingRoomsReturnNotFoundBeforeSweep(t *testing.T) {
 	if created.Code != http.StatusCreated {
 		t.Fatalf("PUT = %d %q", created.Code, created.Body.String())
 	}
-	fixture.clock.setMono(time.Hour)
+	fixture.fakeClock.setMono(time.Hour)
 	terminal := serveHandler(t, fixture.handler, http.MethodGet, "/v1/rooms/room", nil, controlBearer, "")
 	assertErrorResponse(t, terminal, http.StatusNotFound, "not_found", notFoundMessage)
 	retry := serveHandler(t, fixture.handler, http.MethodPut, "/v1/rooms/room", bytes.NewReader(body), controlBearer, "application/json")
@@ -781,14 +782,14 @@ type controlFixture struct {
 	handler      http.Handler
 	store        *store.Store
 	playerTokens *playerauth.Auth
-	clock        *controlStoreClock
+	fakeClock    *controlStoreClock
 	config       Config
 }
 
 func newControlFixture(t *testing.T, limits store.Limits, random io.Reader, mutate func(*Config)) controlFixture {
 	t.Helper()
-	clock := &controlStoreClock{reading: store.ClockReading{Wall: controlTestWall, Mono: 0}}
-	roomStore, err := store.New(store.Config{Limits: limits, Now: clock.now, Random: random})
+	fakeClock := &controlStoreClock{reading: clock.Reading{Wall: controlTestWall, Mono: 0}}
+	roomStore, err := store.New(store.Config{Limits: limits, Now: fakeClock.now, Random: random})
 	if err != nil {
 		t.Fatalf("store.New(): %v", err)
 	}
@@ -818,7 +819,7 @@ func newControlFixture(t *testing.T, limits store.Limits, random io.Reader, muta
 	if err != nil {
 		t.Fatalf("NewHandler(): %v", err)
 	}
-	return controlFixture{handler: handler, store: roomStore, playerTokens: playerTokens, clock: clock, config: config}
+	return controlFixture{handler: handler, store: roomStore, playerTokens: playerTokens, fakeClock: fakeClock, config: config}
 }
 
 func createRoomBody(t *testing.T, wall time.Time, roomTTL time.Duration, participants []testParticipantSpec) []byte {
@@ -1085,19 +1086,19 @@ func nonCanonicalRawURL(value [32]byte) string {
 
 type controlStoreClock struct {
 	mu      sync.Mutex
-	reading store.ClockReading
+	reading clock.Reading
 }
 
-func (clock *controlStoreClock) now() store.ClockReading {
-	clock.mu.Lock()
-	defer clock.mu.Unlock()
-	return clock.reading
+func (fakeClock *controlStoreClock) now() clock.Reading {
+	fakeClock.mu.Lock()
+	defer fakeClock.mu.Unlock()
+	return fakeClock.reading
 }
 
-func (clock *controlStoreClock) setMono(value time.Duration) {
-	clock.mu.Lock()
-	defer clock.mu.Unlock()
-	clock.reading.Mono = value
+func (fakeClock *controlStoreClock) setMono(value time.Duration) {
+	fakeClock.mu.Lock()
+	defer fakeClock.mu.Unlock()
+	fakeClock.reading.Mono = value
 }
 
 type testSequenceReader struct {

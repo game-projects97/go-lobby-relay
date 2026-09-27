@@ -87,7 +87,7 @@ func newWithDependencies(config Config, deps dependencies) (*Server, error) {
 	if err != nil {
 		return nil, errInvalidConfig
 	}
-	lobbies, err := lobby.New(lobby.Config{Relay: rooms, Random: deps.random})
+	lobbies, err := lobby.New(lobby.Config{Rooms: rooms, Random: deps.random})
 	if err != nil {
 		return nil, errInvalidConfig
 	}
@@ -144,7 +144,7 @@ func newWithDependencies(config Config, deps dependencies) (*Server, error) {
 		return nil, errInvalidConfig
 	}
 	playerHandler, err := playerapi.NewHandler(playerapi.Config{
-		Auth: playerTokens, Lobbies: lobbies, AdvertisedHost: config.AdvertisedHost, AdvertisedPort: advertisedPort,
+		PlayerTokens: playerTokens, Lobbies: lobbies, AdvertisedHost: config.AdvertisedHost, AdvertisedPort: advertisedPort,
 		RequestRate: playerapi.HardPlayerRequestRate, RequestBurst: playerapi.HardPlayerRequestBurst,
 		MaxConcurrent: playerapi.HardPlayerConcurrent, Fatal: server.notifyFatal,
 	})

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	relayv1 "github.com/gyungsubLee/go-lobby-relay/gen/go/relay/v1"
+	"github.com/gyungsubLee/go-lobby-relay/internal/clock"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
 	"github.com/gyungsubLee/go-lobby-relay/internal/store"
 	"google.golang.org/protobuf/proto"
@@ -107,21 +108,21 @@ func (socket *fakeSocket) snapshot() ([]fakeWrite, []time.Time, []string, int) {
 
 type testClock struct {
 	mu      sync.Mutex
-	reading store.ClockReading
+	reading clock.Reading
 }
 
-func (clock *testClock) now() store.ClockReading {
-	clock.mu.Lock()
-	defer clock.mu.Unlock()
-	return clock.reading
+func (fakeClock *testClock) now() clock.Reading {
+	fakeClock.mu.Lock()
+	defer fakeClock.mu.Unlock()
+	return fakeClock.reading
 }
 
-func (clock *testClock) set(mono time.Duration) {
-	clock.mu.Lock()
-	defer clock.mu.Unlock()
-	delta := mono - clock.reading.Mono
-	clock.reading.Wall = clock.reading.Wall.Add(delta)
-	clock.reading.Mono = mono
+func (fakeClock *testClock) set(mono time.Duration) {
+	fakeClock.mu.Lock()
+	defer fakeClock.mu.Unlock()
+	delta := mono - fakeClock.reading.Mono
+	fakeClock.reading.Wall = fakeClock.reading.Wall.Add(delta)
+	fakeClock.reading.Mono = mono
 }
 
 type deterministicReader struct {
@@ -153,9 +154,9 @@ func (reader *deterministicReader) fail(err error) {
 }
 
 type storeFixture struct {
-	store  *store.Store
-	clock  *testClock
-	random *deterministicReader
+	store     *store.Store
+	fakeClock *testClock
+	random    *deterministicReader
 }
 
 type testClient struct {
@@ -167,18 +168,18 @@ type testClient struct {
 
 func newStoreFixture(t testing.TB, limits store.Limits) *storeFixture {
 	t.Helper()
-	clock := &testClock{reading: store.ClockReading{Wall: time.Now().UTC().Add(time.Minute)}}
+	fakeClock := &testClock{reading: clock.Reading{Wall: time.Now().UTC().Add(time.Minute)}}
 	random := &deterministicReader{}
-	rooms, err := store.New(store.Config{Limits: limits, Now: clock.now, Random: random})
+	rooms, err := store.New(store.Config{Limits: limits, Now: fakeClock.now, Random: random})
 	if err != nil {
 		t.Fatalf("store.New(): %v", err)
 	}
-	return &storeFixture{store: rooms, clock: clock, random: random}
+	return &storeFixture{store: rooms, fakeClock: fakeClock, random: random}
 }
 
 func (fixture *storeFixture) addRoom(t testing.TB, roomID string, participants int) store.Allocation {
 	t.Helper()
-	now := fixture.clock.now().Wall
+	now := fixture.fakeClock.now().Wall
 	definition := store.RoomDefinition{
 		Capacity: uint32(participants), ExpiresAt: now.Add(time.Hour),
 		Participants: make([]store.ParticipantDefinition, participants),
@@ -417,7 +418,7 @@ func TestDispatchEmitsHandshakeIndependentOfHostWall(t *testing.T) {
 	} {
 		t.Run(wall.Format("2006"), func(t *testing.T) {
 			fixture := newStoreFixture(t, store.DefaultLimits())
-			fixture.clock.reading = store.ClockReading{Wall: wall}
+			fixture.fakeClock.reading = clock.Reading{Wall: wall}
 			allocation := fixture.addRoom(t, "room", 1)
 			socket := new(fakeSocket)
 			relay, err := New(socket, fixture.store, Config{})
@@ -523,7 +524,7 @@ func TestDispatchClassifiesFixedDropReasonsExactlyOnce(t *testing.T) {
 		{"expired", store.RejectExpired, func(t testing.TB, relay *Relay, _ *fakeSocket, fixture *storeFixture) {
 			allocation := fixture.addRoom(t, "room", 1)
 			client := fixture.bindDirect(t, "room", allocation.Grants[0], netip.MustParseAddrPort("192.0.2.11:4000"), 0x55)
-			fixture.clock.set(store.HardMaxBindingTTL)
+			fixture.fakeClock.set(store.HardMaxBindingTTL)
 			_ = relay.dispatch(client.ping(1), client.endpoint)
 		}},
 		{"rate_limited", store.RejectRateLimited, func(_ testing.TB, relay *Relay, _ *fakeSocket, fixture *storeFixture) {
@@ -911,13 +912,13 @@ func (socket *closeSignalSocket) Close() error {
 
 func TestFatalRandomReturnsSafeRunErrorWithoutDropOrDiagnostic(t *testing.T) {
 	limits := store.DefaultLimits()
-	clock := &testClock{reading: store.ClockReading{Wall: time.Now().UTC().Add(time.Minute)}}
+	fakeClock := &testClock{reading: clock.Reading{Wall: time.Now().UTC().Add(time.Minute)}}
 	random := new(deterministicReader)
-	rooms, err := store.New(store.Config{Limits: limits, Now: clock.now, Random: random})
+	rooms, err := store.New(store.Config{Limits: limits, Now: fakeClock.now, Random: random})
 	if err != nil {
 		t.Fatalf("store.New(): %v", err)
 	}
-	fixture := &storeFixture{store: rooms, clock: clock, random: random}
+	fixture := &storeFixture{store: rooms, fakeClock: fakeClock, random: random}
 	allocation := fixture.addRoom(t, "room", 1)
 	client := fixture.bindDirect(t, "room", allocation.Grants[0], netip.MustParseAddrPort("192.0.2.89:4899"), 0xc0)
 	payload := []byte("gameplay-payload-f2ec4b8c")
@@ -1062,7 +1063,7 @@ func TestRealLoopbackEndToEnd(t *testing.T) {
 	newA.sendData(t, relayEndpoint, 2, []byte("after-delete"))
 	b.expectSilence(t)
 
-	fixture.clock.set(store.HardMaxBindingTTL)
+	fixture.fakeClock.set(store.HardMaxBindingTTL)
 	d.sendData(t, relayEndpoint, 1, []byte("at-expiry"))
 	e.expectSilence(t)
 

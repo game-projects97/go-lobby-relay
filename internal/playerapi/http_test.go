@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gyungsubLee/go-lobby-relay/internal/clock"
 	"github.com/gyungsubLee/go-lobby-relay/internal/lobby"
 	"github.com/gyungsubLee/go-lobby-relay/internal/playerauth"
 	"github.com/gyungsubLee/go-lobby-relay/internal/store"
@@ -179,12 +180,12 @@ type fixture struct {
 func newFixture(t *testing.T) fixture {
 	t.Helper()
 	now := apiWall
-	clock := func() store.ClockReading { return store.ClockReading{Wall: now, Mono: time.Hour + now.Sub(apiWall)} }
-	relayStore, err := store.New(store.Config{Limits: store.DefaultLimits(), Now: clock, Random: &sequenceReader{}})
+	fakeClock := func() clock.Reading { return clock.Reading{Wall: now, Mono: time.Hour + now.Sub(apiWall)} }
+	relayStore, err := store.New(store.Config{Limits: store.DefaultLimits(), Now: fakeClock, Random: &sequenceReader{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager, err := lobby.New(lobby.Config{Relay: relayStore, Now: clock, Random: &sequenceReader{next: 1}})
+	manager, err := lobby.New(lobby.Config{Rooms: relayStore, Now: fakeClock, Random: &sequenceReader{next: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +194,7 @@ func newFixture(t *testing.T) fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := NewHandler(Config{Auth: auth, Lobbies: manager, AdvertisedHost: "relay.example.net", AdvertisedPort: 30000, RequestRate: HardPlayerRequestRate, RequestBurst: HardPlayerRequestBurst, MaxConcurrent: HardPlayerConcurrent, Now: func() time.Time { return now }})
+	handler, err := NewHandler(Config{PlayerTokens: auth, Lobbies: manager, AdvertisedHost: "relay.example.net", AdvertisedPort: 30000, RequestRate: HardPlayerRequestRate, RequestBurst: HardPlayerRequestBurst, MaxConcurrent: HardPlayerConcurrent, Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gyungsubLee/go-lobby-relay/internal/clock"
 	"github.com/gyungsubLee/go-lobby-relay/internal/store"
 )
 
@@ -18,17 +19,17 @@ type lobbyTestClock struct {
 	mono time.Duration
 }
 
-func (clock *lobbyTestClock) read() store.ClockReading {
-	clock.mu.Lock()
-	defer clock.mu.Unlock()
-	return store.ClockReading{Wall: clock.wall, Mono: clock.mono}
+func (fakeClock *lobbyTestClock) read() clock.Reading {
+	fakeClock.mu.Lock()
+	defer fakeClock.mu.Unlock()
+	return clock.Reading{Wall: fakeClock.wall, Mono: fakeClock.mono}
 }
 
-func (clock *lobbyTestClock) advance(delta time.Duration) {
-	clock.mu.Lock()
-	clock.wall = clock.wall.Add(delta)
-	clock.mono += delta
-	clock.mu.Unlock()
+func (fakeClock *lobbyTestClock) advance(delta time.Duration) {
+	fakeClock.mu.Lock()
+	fakeClock.wall = fakeClock.wall.Add(delta)
+	fakeClock.mono += delta
+	fakeClock.mu.Unlock()
 }
 
 type incrementingReader struct {
@@ -242,16 +243,16 @@ func TestStartRequiresOwnerFullAndAllReady(t *testing.T) {
 }
 
 func TestLobbyAuthorityExpiresAtExactDeadline(t *testing.T) {
-	manager, _, clock := newLobbyFixture(t)
+	manager, _, fakeClock := newLobbyFixture(t)
 	lobby, err := manager.Create("player-a", CreateRequest{Visibility: VisibilityPublic, QueueKey: "duel", Capacity: 2})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	clock.advance(DefaultLobbyTTL - time.Nanosecond)
+	fakeClock.advance(DefaultLobbyTTL - time.Nanosecond)
 	if _, err := manager.Get("player-a", lobby.LobbyID); err != nil {
 		t.Fatalf("Get before expiry: %v", err)
 	}
-	clock.advance(time.Nanosecond)
+	fakeClock.advance(time.Nanosecond)
 	if _, err := manager.Get("player-a", lobby.LobbyID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Get at expiry = %v, want not found", err)
 	}
@@ -299,20 +300,20 @@ func TestConcurrentJoinNeverExceedsCapacity(t *testing.T) {
 
 func newLobbyFixture(t *testing.T) (*Manager, *store.Store, *lobbyTestClock) {
 	t.Helper()
-	clock := &lobbyTestClock{wall: lobbyTestWall}
+	fakeClock := &lobbyTestClock{wall: lobbyTestWall}
 	relayStore, err := store.New(store.Config{
 		Limits: store.DefaultLimits(),
-		Now:    clock.read,
+		Now:    fakeClock.read,
 		Random: &incrementingReader{next: 0x8000},
 	})
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
-	manager, err := New(Config{Relay: relayStore, Now: clock.read, Random: &incrementingReader{next: 0x1000}})
+	manager, err := New(Config{Rooms: relayStore, Now: fakeClock.read, Random: &incrementingReader{next: 0x1000}})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return manager, relayStore, clock
+	return manager, relayStore, fakeClock
 }
 
 func playerID(index int) string {

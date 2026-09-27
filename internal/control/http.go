@@ -46,7 +46,7 @@ type handler struct {
 	operatorToken  [32]byte
 	advertisedHost string
 	advertisedPort uint16
-	store          *store.Store
+	rooms          *store.Store
 	playerTokens   *playerauth.Auth
 	limiter        *rate.Limiter
 	semaphore      chan struct{}
@@ -54,8 +54,8 @@ type handler struct {
 	fatal          func()
 }
 
-func NewHandler(config Config, roomStore *store.Store) (http.Handler, error) {
-	if roomStore == nil || config.PlayerTokens == nil || config.OperatorToken == [32]byte{} || config.AdvertisedHost == "" || config.AdvertisedPort == 0 ||
+func NewHandler(config Config, rooms *store.Store) (http.Handler, error) {
+	if rooms == nil || config.PlayerTokens == nil || config.OperatorToken == [32]byte{} || config.AdvertisedHost == "" || config.AdvertisedPort == 0 ||
 		!(config.RequestRate > 0 && config.RequestRate <= HardManagementRequestRate) ||
 		config.RequestBurst <= 0 || config.RequestBurst > HardManagementRequestBurst ||
 		config.MaxConcurrent <= 0 || config.MaxConcurrent > HardManagementConcurrent {
@@ -69,7 +69,7 @@ func NewHandler(config Config, roomStore *store.Store) (http.Handler, error) {
 		operatorToken:  config.OperatorToken,
 		advertisedHost: config.AdvertisedHost,
 		advertisedPort: config.AdvertisedPort,
-		store:          roomStore,
+		rooms:          rooms,
 		playerTokens:   config.PlayerTokens,
 		limiter:        rate.NewLimiter(config.RequestRate, config.RequestBurst),
 		semaphore:      make(chan struct{}, config.MaxConcurrent),
@@ -288,7 +288,7 @@ func (handler *handler) putRoom(writer http.ResponseWriter, request *http.Reques
 		writeError(writer, http.StatusBadRequest, "invalid_request", "request is invalid")
 		return
 	}
-	allocation, created, err := handler.store.CreateRoom(roomID, definition)
+	allocation, created, err := handler.rooms.CreateRoom(roomID, definition)
 	if err != nil {
 		writeStoreError(writer, err)
 		if errors.Is(err, store.ErrFatalRandom) && handler.fatal != nil {
@@ -307,7 +307,7 @@ func (handler *handler) putRoom(writer http.ResponseWriter, request *http.Reques
 }
 
 func (handler *handler) getRoom(writer http.ResponseWriter, roomID string) {
-	snapshot, err := handler.store.GetRoom(roomID)
+	snapshot, err := handler.rooms.GetRoom(roomID)
 	if err != nil {
 		writeStoreError(writer, err)
 		return
@@ -316,7 +316,7 @@ func (handler *handler) getRoom(writer http.ResponseWriter, roomID string) {
 }
 
 func (handler *handler) deleteRoom(writer http.ResponseWriter, roomID string) {
-	if err := handler.store.EndRoom(roomID); err != nil {
+	if err := handler.rooms.EndRoom(roomID); err != nil {
 		writeStoreError(writer, err)
 		return
 	}

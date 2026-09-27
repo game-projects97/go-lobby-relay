@@ -127,16 +127,16 @@ func TestMatchedTicketCannotBeCancelled(t *testing.T) {
 }
 
 func TestTicketAuthorityExpiresAtExactDeadline(t *testing.T) {
-	manager, _, clock := newLobbyFixture(t)
+	manager, _, fakeClock := newLobbyFixture(t)
 	ticket, err := manager.Enqueue("player-a", EnqueueRequest{QueueKey: "duel", Capacity: 2})
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	clock.advance(TicketTTL - time.Nanosecond)
+	fakeClock.advance(TicketTTL - time.Nanosecond)
 	if _, err := manager.GetTicket("player-a"); err != nil {
 		t.Fatalf("Get before expiry: %v", err)
 	}
-	clock.advance(time.Nanosecond)
+	fakeClock.advance(time.Nanosecond)
 	if _, err := manager.GetTicket("player-a"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Get at expiry = %v, want not found", err)
 	}
@@ -153,8 +153,8 @@ func TestTicketAuthorityExpiresAtExactDeadline(t *testing.T) {
 }
 
 func TestRelayCapacityFailurePreservesFIFOSelection(t *testing.T) {
-	manager, relayStore, clock := newLimitedLobbyFixture(t)
-	fillRelayStore(t, relayStore, clock.read().Wall)
+	manager, relayStore, fakeClock := newLimitedLobbyFixture(t)
+	fillRelayStore(t, relayStore, fakeClock.read().Wall)
 	first, err := manager.Enqueue("player-a", EnqueueRequest{QueueKey: "duel", Capacity: 2})
 	if err != nil {
 		t.Fatalf("first Enqueue: %v", err)
@@ -171,7 +171,7 @@ func TestRelayCapacityFailurePreservesFIFOSelection(t *testing.T) {
 	if err := relayStore.EndRoom("occupied"); err != nil {
 		t.Fatalf("EndRoom occupied: %v", err)
 	}
-	clock.advance(store.DefaultLimits().TombstoneTTL)
+	fakeClock.advance(store.DefaultLimits().TombstoneTTL)
 	relayStore.Expire()
 	third, err := manager.Enqueue("player-c", EnqueueRequest{QueueKey: "duel", Capacity: 2})
 	if err != nil || third.State != TicketStateQueued {
@@ -253,13 +253,13 @@ func TestQuickMatchValidation(t *testing.T) {
 }
 
 func TestQuickMatchFatalRandomLeavesSelectedTicketsQueued(t *testing.T) {
-	clock := &lobbyTestClock{wall: lobbyTestWall}
-	relayStore, err := store.New(store.Config{Limits: store.DefaultLimits(), Now: clock.read, Random: &incrementingReader{next: 0xa000}})
+	fakeClock := &lobbyTestClock{wall: lobbyTestWall}
+	relayStore, err := store.New(store.Config{Limits: store.DefaultLimits(), Now: fakeClock.read, Random: &incrementingReader{next: 0xa000}})
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
 	random := append(bytes.Repeat([]byte{0x11}, 16), bytes.Repeat([]byte{0x22}, 16)...)
-	manager, err := New(Config{Relay: relayStore, Now: clock.read, Random: bytes.NewReader(random)})
+	manager, err := New(Config{Rooms: relayStore, Now: fakeClock.read, Random: bytes.NewReader(random)})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -279,18 +279,18 @@ func TestQuickMatchFatalRandomLeavesSelectedTicketsQueued(t *testing.T) {
 
 func newLimitedLobbyFixture(t *testing.T) (*Manager, *store.Store, *lobbyTestClock) {
 	t.Helper()
-	clock := &lobbyTestClock{wall: lobbyTestWall}
+	fakeClock := &lobbyTestClock{wall: lobbyTestWall}
 	limits := store.DefaultLimits()
 	limits.MaxOpenRooms = 1
-	relayStore, err := store.New(store.Config{Limits: limits, Now: clock.read, Random: &incrementingReader{next: 0x9000}})
+	relayStore, err := store.New(store.Config{Limits: limits, Now: fakeClock.read, Random: &incrementingReader{next: 0x9000}})
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
-	manager, err := New(Config{Relay: relayStore, Now: clock.read, Random: &incrementingReader{next: 0x3000}})
+	manager, err := New(Config{Rooms: relayStore, Now: fakeClock.read, Random: &incrementingReader{next: 0x3000}})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return manager, relayStore, clock
+	return manager, relayStore, fakeClock
 }
 
 func fillRelayStore(t *testing.T, relayStore *store.Store, now time.Time) {

@@ -4,8 +4,8 @@ import (
 	"math"
 	"time"
 
+	"github.com/gyungsubLee/go-lobby-relay/internal/clock"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
-	"github.com/gyungsubLee/go-lobby-relay/internal/store"
 )
 
 const (
@@ -34,11 +34,6 @@ type TicketSnapshot struct {
 	Revision                     uint64
 	ExpiresAt                    time.Time
 	Assignment                   *Assignment
-}
-
-type queueKey struct {
-	queueKey string
-	capacity uint32
 }
 
 type ticketRecord struct {
@@ -79,7 +74,7 @@ func (manager *Manager) Enqueue(playerID string, request EnqueueRequest) (Ticket
 	if err != nil {
 		return TicketSnapshot{}, err
 	}
-	deadline, ok := deadlineAfter(reading.Mono, TicketTTL)
+	deadline, ok := clock.DeadlineAfter(reading.Mono, TicketTTL)
 	if !ok {
 		return TicketSnapshot{}, ErrInvalid
 	}
@@ -137,66 +132,7 @@ func validEnqueueRequest(request EnqueueRequest) bool {
 	return protocol.ValidID(request.QueueKey) && request.Capacity >= 2 && request.Capacity <= HardMaxMembers
 }
 
-func (manager *Manager) matchQueueLocked(key queueKey, reading store.ClockReading) error {
-	manager.compactQueueLocked(key)
-	for len(manager.queues[key]) >= int(key.capacity) {
-		selectedIDs := manager.queues[key][:key.capacity]
-		players := append([]string(nil), selectedIDs...)
-		matchID, _, assignments, expiresAt, deadline, err := manager.allocateMatchLocked(players, reading)
-		if err != nil {
-			return err
-		}
-		for _, playerID := range players {
-			ticket := manager.ticketsByPlayer[playerID]
-			assignment := assignments[playerID]
-			ticket.state = TicketStateMatched
-			ticket.revision++
-			ticket.expiresAt = expiresAt
-			ticket.monoDeadline = deadline
-			ticket.assignment = &assignment
-		}
-		manager.matchIDs[matchID] = struct{}{}
-		remaining := append([]string(nil), manager.queues[key][key.capacity:]...)
-		if len(remaining) == 0 {
-			delete(manager.queues, key)
-			return nil
-		}
-		manager.queues[key] = remaining
-	}
-	return nil
-}
-
-func (manager *Manager) compactQueueLocked(key queueKey) {
-	queued := manager.queues[key]
-	kept := queued[:0]
-	for _, playerID := range queued {
-		ticket := manager.ticketsByPlayer[playerID]
-		if ticket != nil && ticket.state == TicketStateQueued && ticket.queueKey == key.queueKey && ticket.capacity == key.capacity {
-			kept = append(kept, playerID)
-		}
-	}
-	if len(kept) == 0 {
-		delete(manager.queues, key)
-		return
-	}
-	manager.queues[key] = kept
-}
-
-func (manager *Manager) removeQueuedPlayerLocked(key queueKey, playerID string) {
-	queued := manager.queues[key]
-	for index, candidate := range queued {
-		if candidate != playerID {
-			continue
-		}
-		manager.queues[key] = append(queued[:index], queued[index+1:]...)
-		if len(manager.queues[key]) == 0 {
-			delete(manager.queues, key)
-		}
-		return
-	}
-}
-
-func (manager *Manager) expireTicketsLocked(reading store.ClockReading) {
+func (manager *Manager) expireTicketsLocked(reading clock.Reading) {
 	for playerID, ticket := range manager.ticketsByPlayer {
 		if reading.Mono < ticket.monoDeadline {
 			continue
@@ -205,7 +141,7 @@ func (manager *Manager) expireTicketsLocked(reading store.ClockReading) {
 			manager.removeQueuedPlayerLocked(queueKey{queueKey: ticket.queueKey, capacity: ticket.capacity}, playerID)
 		}
 		if ticket.state == TicketStateMatched && ticket.assignment != nil {
-			_ = manager.relay.EndRoom(ticket.assignment.RoomID)
+			_ = manager.rooms.EndRoom(ticket.assignment.RoomID)
 			delete(manager.matchIDs, ticket.assignment.MatchID)
 		}
 		delete(manager.ticketsByPlayer, playerID)
