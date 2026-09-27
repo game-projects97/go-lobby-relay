@@ -18,6 +18,7 @@ cleanup() {
   if [[ $code != 0 && $changed == true ]]; then
     if [[ -n $old && -x $old/lobby-relay ]]; then
       activate "$old"
+      systemctl try-reload-or-restart caddy.service || true
       restored=false
       if systemctl restart lobby-relay.service; then
         for _ in {1..15}; do
@@ -53,9 +54,10 @@ PY
 python3 - /etc/lobby-relay/server.env <<'PY'
 import re,sys
 values=dict(line.split('=',1) for line in open(sys.argv[1]).read().splitlines() if line and not line.startswith('#'))
-host=values.get('RELAY_ADVERTISED_HOST',''); port=values.get('RELAY_UDP_PORT','')
-if not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?',host) or not re.fullmatch(r'[0-9]{4,5}',port) or not 1024<=int(port)<=65535:
-    raise SystemExit('server.env requires RELAY_ADVERTISED_HOST and an unprivileged RELAY_UDP_PORT')
+name=r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?'
+port=values.get('RELAY_UDP_PORT','')
+if not all(re.fullmatch(name,values.get(key,'')) for key in ('API_HOSTNAME','RELAY_ADVERTISED_HOST')) or not re.fullmatch(r'[1-9][0-9]{3,4}',port) or not 1024<=int(port)<=65535:
+    raise SystemExit('server.env requires API_HOSTNAME, RELAY_ADVERTISED_HOST and an unprivileged RELAY_UDP_PORT')
 PY
 chmod 0755 "$stage" "$stage/lobby-relay"
 if [[ -e $release ]]; then
@@ -68,12 +70,15 @@ activate() {
   local target=$1
   install -d -m 0755 /opt/lobby-relay/ops
   install -m 0755 "$target/scripts/check-traffic-budget.sh" "$target/scripts/traffic_budget.py" /opt/lobby-relay/ops/
-  install -m 0644 "$target/ops/lobby-relay.service" "$target/ops/cloudflared.service" "$target/ops/traffic-guard.service" "$target/ops/traffic-guard.timer" /etc/systemd/system/
+  install -m 0644 "$target/ops/lobby-relay.service" "$target/ops/traffic-guard.service" "$target/ops/traffic-guard.timer" /etc/systemd/system/
+  install -d -m 0755 /etc/systemd/system/caddy.service.d
+  install -m 0644 "$target/ops/caddy-lobby-relay.conf" /etc/systemd/system/caddy.service.d/lobby-relay.conf
+  install -m 0644 "$target/ops/Caddyfile" /etc/caddy/Caddyfile
   ln -sfn "$target" /opt/lobby-relay/current.next
   mv -Tf /opt/lobby-relay/current.next /opt/lobby-relay/current
   systemctl daemon-reload
 }
-[[ -e /var/lib/lobby-relay/traffic.json ]] || { echo 'initialize traffic guard before starting the relay' >&2; exit 1; }
+[[ -e /var/lib/lobby-relay/traffic.json ]] || { echo 'run setup-host.sh before the first deployment' >&2; exit 1; }
 changed=true
 activate "$release"
 systemctl enable lobby-relay.service >/dev/null
@@ -84,12 +89,11 @@ for _ in {1..15}; do
   sleep 1
 done
 [[ $healthy == true ]] || { echo 'new server health check failed' >&2; exit 1; }
-# Tunnel binary changes require a separate direct-admin maintenance operation:
-# restarting the connector would interrupt this SSH deployment connection.
-if [[ ! -x /opt/lobby-relay/ops/cloudflared ]]; then install -m 0755 "$release/cloudflared" /opt/lobby-relay/ops/cloudflared; fi
 # Reconcile now: a timer alone leaves a window with stale/corrupt accounting.
 systemctl start traffic-guard.service
 [[ ! -e /var/lib/lobby-relay/traffic-stopped ]] || { echo 'cost guard stopped deployment' >&2; exit 1; }
 systemctl enable --now traffic-guard.timer >/dev/null
-systemctl enable --now cloudflared.service >/dev/null
+# Reload applies a changed Caddyfile without dropping TLS; it starts Caddy on first deploy.
+systemctl enable caddy.service >/dev/null
+systemctl reload-or-restart caddy.service
 echo "deployed $2; previous=${old:-none}"

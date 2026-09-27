@@ -12,7 +12,7 @@ spec = importlib.util.spec_from_file_location("traffic", Path(__file__).parents[
 traffic = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(traffic)
 
-assert traffic.GUARDED_UNITS == ("lobby-relay.service", "cloudflared.service"), "public UDP relay must be stopped with the Tunnel"
+assert traffic.GUARDED_UNITS == ("lobby-relay.service", "caddy.service"), "every public path must be stopped"
 
 with tempfile.TemporaryDirectory() as d:
     root = Path(d)

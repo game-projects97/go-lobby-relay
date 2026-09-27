@@ -1,0 +1,8 @@
+# Installed to /etc/caddy/Caddyfile by deploy-backend.sh.
+# API_HOSTNAME comes from /etc/lobby-relay/server.env via caddy-lobby-relay.conf.
+# Caddy obtains and renews the certificate itself (ports 80 and 443 must be open).
+{$API_HOSTNAME} {
+	# Player API only. The operator API (127.0.0.1:8081) is never proxied.
+	# Body size, auth and admission limits are enforced by the Go server (HTTP 413/401/429).
+	reverse_proxy 127.0.0.1:8080
+}

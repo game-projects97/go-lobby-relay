@@ -36,29 +36,18 @@ jobs:
       - run: go test -race ./...
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
-  infrastructure:
+  deployment-scripts:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
-        with:
-          terraform_version: '1.15.5'
-          terraform_wrapper: false
-      - name: Offline Terraform checks with mocked providers
-        run: |
-          terraform -chdir=infrastructure/terraform fmt -check -recursive
-          for stack in infrastructure/terraform/bootstrap infrastructure/terraform; do
-            terraform -chdir="$stack" init -backend=false -input=false -lockfile=readonly
-            terraform -chdir="$stack" validate
-            terraform -chdir="$stack" test
-          done
       - name: Deployment and traffic safety checks
         run: |
           sh -n infrastructure/scripts/check-traffic-budget.sh
-          bash -n infrastructure/scripts/check-deployment.sh infrastructure/scripts/deploy-backend.sh infrastructure/scripts/package-release.sh
+          bash -n infrastructure/scripts/check-deployment.sh infrastructure/scripts/deploy-backend.sh infrastructure/scripts/package-release.sh infrastructure/scripts/setup-host.sh
           python3 infrastructure/scripts/tests/traffic-budget.py
           python3 infrastructure/scripts/tests/deploy-backend.py
-          python3 infrastructure/scripts/tests/runtime-secrets.py
+          python3 infrastructure/scripts/tests/operator-token.py
+          python3 infrastructure/scripts/tests/setup-host.py

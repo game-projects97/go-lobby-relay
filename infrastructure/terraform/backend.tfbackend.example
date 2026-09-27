@@ -1,3 +1,0 @@
-bucket = "REPLACE-account-unique-lobby-relay-state"
-# Region, key, encrypt and use_lockfile are fixed in backend.tf.
-# Authentication uses AWS_PROFILE locally or short-lived GitHub OIDC environment credentials.

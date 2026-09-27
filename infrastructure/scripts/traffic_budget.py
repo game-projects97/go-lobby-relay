@@ -10,9 +10,9 @@ import re
 import subprocess
 import tempfile
 
-# Public UDP reaches the relay directly, so stopping only the Tunnel would not
-# stop the dominant traffic. The relay holds no durable state to drain.
-GUARDED_UNITS = ("lobby-relay.service", "cloudflared.service")
+# Every public path: UDP to the relay itself and HTTPS through Caddy. The relay
+# holds no durable state to drain.
+GUARDED_UNITS = ("lobby-relay.service", "caddy.service")
 
 
 class Uncertain(ValueError):
