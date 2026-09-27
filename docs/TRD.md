@@ -58,15 +58,19 @@ flowchart LR
 
 | Package | Responsibility | Mutable authority |
 |---|---|---|
-| `internal/playerauth` | process-ephemeral Player Token issue/verify | derived key only |
-| `internal/lobby` | Lobby, membership, ready, ticket, assignment and match transition | all Lobby/Match maps under one mutex |
-| `internal/playerapi` | Player Bearer auth, strict JSON/routes, domain-to-HTTP mapping | limiter/semaphore only |
-| `internal/control` | operator auth, token issue, existing Relay room API | limiter/semaphore only |
-| `internal/store` | existing immutable Relay room/grant/binding/admission state | existing store mutex |
-| `internal/relay` | existing UDP decode/admission/fan-out | socket and fixed buffers |
-| `internal/server` | bind, composition, four owned loops, shutdown/join | lifecycle flags only |
+| `internal/clock` | wall/monotonic reading and overflow-safe deadlines | none |
+| `internal/protocol` | wire bounds, codec and handshake/data HMAC transcripts | none |
+| `internal/playerauth` | process-ephemeral Player Token issue/verify (`playerauth.Issuer`) | derived key only |
+| `internal/matchmaking` | Lobby, membership, ready, ticket, queue, assignment and match transition | all Lobby/Match maps under one mutex |
+| `internal/relayroom` | immutable Relay room/grant/binding state, handshake and UDP admission limits | room store mutex |
+| `internal/udprelay` | UDP decode/admission/fan-out loop | socket and fixed buffers |
+| `internal/httpapi/httpx` | shared strict JSON, error writer and request admission helpers | none |
+| `internal/httpapi/playerapi` | Player Bearer auth, routes, domain-to-HTTP mapping | limiter/semaphore only |
+| `internal/httpapi/operatorapi` | operator auth, token issue, Relay room API | limiter/semaphore only |
+| `internal/app` | bind, composition, four owned loops, shutdown/join | lifecycle flags only |
+| `cmd/lobby-relay` | flag parsing, operator token file, signal context, exit code | none |
 
-Lock direction is `lobby.Manager.mu -> store.Store.mu` during allocation. Store code never calls Lobby code, so reverse acquisition does not exist.
+Lock direction is `matchmaking.Manager.mu -> relayroom.Store.mu` during allocation. Room store code never calls matchmaking code, so reverse acquisition does not exist.
 
 ## 5. Player Token Contract
 
@@ -379,8 +383,8 @@ M1 completion evidence is recorded only from a clean candidate after all rows pa
 |---|---|---:|
 | existing protocol/store/control/relay/server | PROT-01~02, ROOM-01~03, SESS-01~04, RELY-01~03, SAFE-01~03 | 1–3 complete |
 | `internal/playerauth`, operator token endpoint | AUTH-01 | 4 complete |
-| `internal/lobby` lifecycle, `internal/playerapi` | LOBBY-01~04 | 4 complete |
-| `internal/lobby` matcher and assignment, E2E | MATCH-01~03 | 5 complete |
+| `internal/matchmaking` lifecycle, `internal/httpapi/playerapi` | LOBBY-01~04 | 4 complete |
+| `internal/matchmaking` matcher and assignment, E2E | MATCH-01~03 | 5 complete |
 | actual C# game client integration | UNITY-01~03 | 6 |
 | operations | OPS-01~04 | 7 |
 | packaging/deployment | SHIP-01~03 | 8 |

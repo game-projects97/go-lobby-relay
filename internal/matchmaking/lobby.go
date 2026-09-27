@@ -1,4 +1,4 @@
-package lobby
+package matchmaking
 
 import (
 	"math"
@@ -25,7 +25,7 @@ const (
 	LobbyStateClosed  LobbyState = "closed"
 )
 
-type CreateRequest struct {
+type CreateLobbyRequest struct {
 	Visibility Visibility
 	QueueKey   string
 	Capacity   uint32
@@ -78,8 +78,8 @@ type memberRecord struct {
 	joinSequence uint64
 }
 
-func (manager *Manager) Create(playerID string, request CreateRequest) (LobbySnapshot, error) {
-	if !protocol.ValidID(playerID) || !validCreateRequest(request) {
+func (manager *Manager) CreateLobby(playerID string, request CreateLobbyRequest) (LobbySnapshot, error) {
+	if !protocol.ValidID(playerID) || !validCreateLobbyRequest(request) {
 		return LobbySnapshot{}, ErrInvalid
 	}
 	manager.mu.Lock()
@@ -124,10 +124,10 @@ func (manager *Manager) Create(playerID string, request CreateRequest) (LobbySna
 	record.members[playerID] = &memberRecord{playerID: playerID, joinSequence: record.sequence}
 	manager.lobbiesByID[lobbyID] = record
 	manager.lobbyByPlayer[playerID] = lobbyID
-	return snapshotFor(record, playerID), nil
+	return lobbySnapshot(record, playerID), nil
 }
 
-func (manager *Manager) List(queueKey, cursor string, limit int) (LobbyPage, error) {
+func (manager *Manager) ListLobbies(queueKey, cursor string, limit int) (LobbyPage, error) {
 	if !protocol.ValidID(queueKey) || limit <= 0 || limit > HardMaxListPage {
 		return LobbyPage{}, ErrInvalid
 	}
@@ -151,7 +151,7 @@ func (manager *Manager) List(queueKey, cursor string, limit int) (LobbyPage, err
 	}
 	page := LobbyPage{Lobbies: make([]LobbySummary, len(records))}
 	for index, record := range records {
-		page.Lobbies[index] = summaryFor(record)
+		page.Lobbies[index] = lobbySummary(record)
 	}
 	if hasMore {
 		page.NextCursor = strconv.FormatUint(records[len(records)-1].sequence, 10)
@@ -159,7 +159,7 @@ func (manager *Manager) List(queueKey, cursor string, limit int) (LobbyPage, err
 	return page, nil
 }
 
-func (manager *Manager) Get(playerID, lobbyID string) (LobbySnapshot, error) {
+func (manager *Manager) GetLobby(playerID, lobbyID string) (LobbySnapshot, error) {
 	if !protocol.ValidID(playerID) || !protocol.ValidID(lobbyID) {
 		return LobbySnapshot{}, ErrInvalid
 	}
@@ -174,10 +174,10 @@ func (manager *Manager) Get(playerID, lobbyID string) (LobbySnapshot, error) {
 	if (record.visibility == VisibilityPrivate || record.state == LobbyStateMatched) && !member {
 		return LobbySnapshot{}, ErrNotFound
 	}
-	return snapshotFor(record, playerID), nil
+	return lobbySnapshot(record, playerID), nil
 }
 
-func (manager *Manager) Join(playerID, lobbyID string, revision uint64) (LobbySnapshot, error) {
+func (manager *Manager) JoinLobby(playerID, lobbyID string, revision uint64) (LobbySnapshot, error) {
 	if !protocol.ValidID(playerID) || !protocol.ValidID(lobbyID) || revision == 0 {
 		return LobbySnapshot{}, ErrInvalid
 	}
@@ -208,10 +208,10 @@ func (manager *Manager) Join(playerID, lobbyID string, revision uint64) (LobbySn
 	manager.lobbyByPlayer[playerID] = lobbyID
 	resetReady(record)
 	record.revision++
-	return snapshotFor(record, playerID), nil
+	return lobbySnapshot(record, playerID), nil
 }
 
-func (manager *Manager) Leave(playerID, lobbyID string, revision uint64) (LobbySnapshot, error) {
+func (manager *Manager) LeaveLobby(playerID, lobbyID string, revision uint64) (LobbySnapshot, error) {
 	if !protocol.ValidID(playerID) || !protocol.ValidID(lobbyID) || revision == 0 {
 		return LobbySnapshot{}, ErrInvalid
 	}
@@ -237,7 +237,7 @@ func (manager *Manager) Leave(playerID, lobbyID string, revision uint64) (LobbyS
 	if len(record.members) == 0 {
 		record.state = LobbyStateClosed
 		record.ownerPlayerID = ""
-		closed := snapshotFor(record, playerID)
+		closed := lobbySnapshot(record, playerID)
 		delete(manager.lobbiesByID, lobbyID)
 		return closed, nil
 	}
@@ -245,7 +245,7 @@ func (manager *Manager) Leave(playerID, lobbyID string, revision uint64) (LobbyS
 		record.ownerPlayerID = firstMember(record).playerID
 	}
 	resetReady(record)
-	return snapshotFor(record, playerID), nil
+	return lobbySnapshot(record, playerID), nil
 }
 
 func (manager *Manager) SetReady(playerID, lobbyID string, revision uint64, ready bool) (LobbySnapshot, error) {
@@ -267,17 +267,17 @@ func (manager *Manager) SetReady(playerID, lobbyID string, revision uint64, read
 		return LobbySnapshot{}, ErrNotFound
 	}
 	if member.ready == ready {
-		return snapshotFor(record, playerID), nil
+		return lobbySnapshot(record, playerID), nil
 	}
 	if record.revision == math.MaxUint64 {
 		return LobbySnapshot{}, ErrCapacity
 	}
 	member.ready = ready
 	record.revision++
-	return snapshotFor(record, playerID), nil
+	return lobbySnapshot(record, playerID), nil
 }
 
-func (manager *Manager) Start(playerID, lobbyID string, revision uint64) (Assignment, error) {
+func (manager *Manager) StartMatch(playerID, lobbyID string, revision uint64) (Assignment, error) {
 	if !protocol.ValidID(playerID) || !protocol.ValidID(lobbyID) || revision == 0 {
 		return Assignment{}, ErrInvalid
 	}
@@ -312,9 +312,9 @@ func (manager *Manager) Start(playerID, lobbyID string, revision uint64) (Assign
 	return match.assignments[playerID], nil
 }
 
-func validCreateRequest(request CreateRequest) bool {
+func validCreateLobbyRequest(request CreateLobbyRequest) bool {
 	return (request.Visibility == VisibilityPublic || request.Visibility == VisibilityPrivate) &&
-		protocol.ValidID(request.QueueKey) && request.Capacity >= 2 && request.Capacity <= HardMaxMembers
+		protocol.ValidID(request.QueueKey) && request.Capacity >= 2 && request.Capacity <= HardMaxMatchSize
 }
 
 func parseCursor(cursor string) (uint64, error) {
@@ -378,7 +378,7 @@ func membersInJoinOrder(record *lobbyRecord) []string {
 	return result
 }
 
-func snapshotFor(record *lobbyRecord, playerID string) LobbySnapshot {
+func lobbySnapshot(record *lobbyRecord, playerID string) LobbySnapshot {
 	snapshot := LobbySnapshot{
 		LobbyID: record.id, OwnerPlayerID: record.ownerPlayerID, QueueKey: record.queueKey,
 		Visibility: record.visibility, Capacity: record.capacity, Revision: record.revision,
@@ -391,13 +391,13 @@ func snapshotFor(record *lobbyRecord, playerID string) LobbySnapshot {
 		snapshot.Members[index] = MemberSnapshot{PlayerID: member.playerID, Ready: member.ready}
 	}
 	if assignment, exists := record.assignments[playerID]; exists {
-		copy := assignment
-		snapshot.Assignment = &copy
+		assignmentCopy := assignment
+		snapshot.Assignment = &assignmentCopy
 	}
 	return snapshot
 }
 
-func summaryFor(record *lobbyRecord) LobbySummary {
+func lobbySummary(record *lobbyRecord) LobbySummary {
 	return LobbySummary{
 		LobbyID: record.id, OwnerPlayerID: record.ownerPlayerID, QueueKey: record.queueKey,
 		Visibility: record.visibility, Capacity: record.capacity, MemberCount: uint32(len(record.members)),

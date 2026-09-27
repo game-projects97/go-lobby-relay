@@ -29,7 +29,7 @@ func TestParseConfigRequiresExactFlagsAndWiresToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseConfig(valid): %v", err)
 	}
-	if config.ManagementListen != "127.0.0.1:0" || config.PlayerListen != "127.0.0.1:0" || config.RelayNetwork != "udp4" ||
+	if config.OperatorListen != "127.0.0.1:0" || config.PlayerListen != "127.0.0.1:0" || config.RelayNetwork != "udp4" ||
 		config.RelayListen != "127.0.0.1:0" || config.AdvertisedHost != "relay.test" ||
 		config.AdvertisedPort != 30000 || config.OperatorToken != cliTestToken {
 		t.Fatalf("parseConfig(valid) = %#v", config)
@@ -205,8 +205,8 @@ func TestActualMainSignalAndMalformedArgumentsAreSecretFree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Abs(): %v", err)
 	}
-	binary := filepath.Join(t.TempDir(), "relay")
-	build := exec.Command(filepath.Join(root, ".tools", "go", "bin", "go"), "build", "-o", binary, "./cmd/relay")
+	binary := filepath.Join(t.TempDir(), "lobby-relay")
+	build := exec.Command(filepath.Join(root, ".tools", "go", "bin", "go"), "build", "-o", binary, "./cmd/lobby-relay")
 	build.Dir = root
 	build.Env = append(os.Environ(), "GOCACHE="+filepath.Join(root, ".cache", "go-build"), "GOMODCACHE="+filepath.Join(root, ".cache", "go-mod"))
 	if output, err := build.CombinedOutput(); err != nil {

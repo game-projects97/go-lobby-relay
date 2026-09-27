@@ -43,7 +43,7 @@ The future Director seam is the stable `PUT /v1/rooms/{room_id}` request/respons
 
 | Component | Responsibility | Owns mutable state | Communicates With |
 |-----------|----------------|--------------------|-------------------|
-| `cmd/relay` composition root | Parse/validate configuration, construct components, install signal context, choose exit code | Process lifecycle only | Server lifecycle |
+| `cmd/lobby-relay` composition root | Parse/validate configuration, construct components, install signal context, choose exit code | Process lifecycle only | Server lifecycle |
 | Server lifecycle | Start HTTP, UDP, and sweeper; expose readiness; coordinate bounded shutdown | Readiness/draining flags | HTTP adapter, UDP relay, sweeper, store |
 | Management HTTP adapter | Authenticate operator, bound/decode requests, map store errors to JSON/HTTP, serve health | None | Store, readiness |
 | UDP relay adapter | Read one datagram, enforce byte/type/version bounds, run bind protocol, authorize data, fan out one encoded packet | Reusable receive buffer and socket only | Protocol codec, store, `net.UDPConn` |
@@ -66,12 +66,14 @@ The future Director seam is the stable `PUT /v1/rooms/{room_id}` request/respons
 
 ```text
 api/relay/v1/relay.proto           # single wire-contract source
-cmd/relay/main.go                  # config and composition only
+cmd/lobby-relay/main.go            # config and composition only
 cmd/relay-load/main.go             # independent load client
-internal/server/server.go          # lifecycle/start/drain/stop
-internal/control/http.go           # management and health handlers
-internal/relay/udp.go              # datagram loop and fanout
-internal/store/store.go            # room/session state owner
+internal/app/server.go             # lifecycle/start/drain/stop
+internal/httpapi/operatorapi/      # operator room and token handlers
+internal/httpapi/playerapi/        # player lobby and ticket handlers
+internal/udprelay/udp.go           # datagram loop and fanout
+internal/relayroom/                # room/session state owner
+internal/matchmaking/              # lobby, ticket and match state owner
 internal/protocol/codec.go         # bounds + canonical bind transcript
 gen/go/relay/v1/...                # generated Go messages
 unity/RelaySample/Assets/Relay/... # client + generated C# messages

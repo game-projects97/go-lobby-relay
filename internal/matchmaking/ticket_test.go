@@ -1,4 +1,4 @@
-package lobby
+package matchmaking
 
 import (
 	"bytes"
@@ -8,18 +8,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gyungsubLee/go-lobby-relay/internal/store"
+	"github.com/gyungsubLee/go-lobby-relay/internal/relayroom"
 )
 
 func TestQuickMatchFIFOEqualityAndOneOver(t *testing.T) {
 	manager, relayStore, _ := newLobbyFixture(t)
-	first, err := manager.Enqueue("player-a", EnqueueRequest{QueueKey: "duel", Capacity: 2})
+	first, err := manager.CreateTicket("player-a", CreateTicketRequest{QueueKey: "duel", Capacity: 2})
 	if err != nil || first.State != TicketStateQueued || first.Assignment != nil {
-		t.Fatalf("first Enqueue = %#v, %v", first, err)
+		t.Fatalf("first CreateTicket = %#v, %v", first, err)
 	}
-	second, err := manager.Enqueue("player-b", EnqueueRequest{QueueKey: "duel", Capacity: 2})
+	second, err := manager.CreateTicket("player-b", CreateTicketRequest{QueueKey: "duel", Capacity: 2})
 	if err != nil || second.State != TicketStateMatched || second.Assignment == nil {
-		t.Fatalf("second Enqueue = %#v, %v", second, err)
+		t.Fatalf("second CreateTicket = %#v, %v", second, err)
 	}
 	firstMatched, err := manager.GetTicket("player-a")
 	if err != nil || firstMatched.State != TicketStateMatched || firstMatched.Assignment == nil {
@@ -37,9 +37,9 @@ func TestQuickMatchFIFOEqualityAndOneOver(t *testing.T) {
 		t.Fatalf("Relay room = %#v, %v", room, err)
 	}
 
-	third, err := manager.Enqueue("player-c", EnqueueRequest{QueueKey: "duel", Capacity: 2})
+	third, err := manager.CreateTicket("player-c", CreateTicketRequest{QueueKey: "duel", Capacity: 2})
 	if err != nil || third.State != TicketStateQueued {
-		t.Fatalf("one-over Enqueue = %#v, %v", third, err)
+		t.Fatalf("one-over CreateTicket = %#v, %v", third, err)
 	}
 }
 
@@ -55,14 +55,14 @@ func TestQuickMatchIsolatesQueueKeyAndCapacity(t *testing.T) {
 		{"player-c", "duel", 3},
 	}
 	for _, request := range requests {
-		ticket, err := manager.Enqueue(request.player, EnqueueRequest{QueueKey: request.queueKey, Capacity: request.capacity})
+		ticket, err := manager.CreateTicket(request.player, CreateTicketRequest{QueueKey: request.queueKey, Capacity: request.capacity})
 		if err != nil || ticket.State != TicketStateQueued {
-			t.Fatalf("Enqueue(%s) = %#v, %v", request.player, ticket, err)
+			t.Fatalf("CreateTicket(%s) = %#v, %v", request.player, ticket, err)
 		}
 	}
-	duel, err := manager.Enqueue("player-d", EnqueueRequest{QueueKey: "duel", Capacity: 2})
+	duel, err := manager.CreateTicket("player-d", CreateTicketRequest{QueueKey: "duel", Capacity: 2})
 	if err != nil || duel.State != TicketStateMatched {
-		t.Fatalf("compatible Enqueue = %#v, %v", duel, err)
+		t.Fatalf("compatible CreateTicket = %#v, %v", duel, err)
 	}
 	for _, player := range []string{"player-b", "player-c"} {
 		ticket, err := manager.GetTicket(player)
@@ -74,29 +74,29 @@ func TestQuickMatchIsolatesQueueKeyAndCapacity(t *testing.T) {
 
 func TestLobbyAndTicketOwnershipAreMutuallyExclusive(t *testing.T) {
 	manager, _, _ := newLobbyFixture(t)
-	lobby, err := manager.Create("player-a", CreateRequest{Visibility: VisibilityPublic, QueueKey: "duel", Capacity: 2})
+	lobby, err := manager.CreateLobby("player-a", CreateLobbyRequest{Visibility: VisibilityPublic, QueueKey: "duel", Capacity: 2})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if _, err := manager.Enqueue("player-a", EnqueueRequest{QueueKey: "duel", Capacity: 2}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("Enqueue while in Lobby = %v, want conflict", err)
+	if _, err := manager.CreateTicket("player-a", CreateTicketRequest{QueueKey: "duel", Capacity: 2}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("CreateTicket while in Lobby = %v, want conflict", err)
 	}
-	if _, err := manager.Enqueue("player-b", EnqueueRequest{QueueKey: "duel", Capacity: 2}); err != nil {
-		t.Fatalf("Enqueue player-b: %v", err)
+	if _, err := manager.CreateTicket("player-b", CreateTicketRequest{QueueKey: "duel", Capacity: 2}); err != nil {
+		t.Fatalf("CreateTicket player-b: %v", err)
 	}
-	if _, err := manager.Join("player-b", lobby.LobbyID, lobby.Revision); !errors.Is(err, ErrConflict) {
+	if _, err := manager.JoinLobby("player-b", lobby.LobbyID, lobby.Revision); !errors.Is(err, ErrConflict) {
 		t.Fatalf("Join while queued = %v, want conflict", err)
 	}
-	if _, err := manager.Create("player-b", CreateRequest{Visibility: VisibilityPublic, QueueKey: "duel", Capacity: 2}); !errors.Is(err, ErrConflict) {
+	if _, err := manager.CreateLobby("player-b", CreateLobbyRequest{Visibility: VisibilityPublic, QueueKey: "duel", Capacity: 2}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("Create while queued = %v, want conflict", err)
 	}
 }
 
 func TestCancelTicketRequiresRevisionAndReleasesPlayer(t *testing.T) {
 	manager, _, _ := newLobbyFixture(t)
-	ticket, err := manager.Enqueue("player-a", EnqueueRequest{QueueKey: "duel", Capacity: 2})
+	ticket, err := manager.CreateTicket("player-a", CreateTicketRequest{QueueKey: "duel", Capacity: 2})
 	if err != nil {
-		t.Fatalf("Enqueue: %v", err)
+		t.Fatalf("CreateTicket: %v", err)
 	}
 	if _, err := manager.CancelTicket("player-a", ticket.Revision+1); !errors.Is(err, ErrConflict) {
 		t.Fatalf("stale Cancel = %v, want conflict", err)
@@ -108,15 +108,15 @@ func TestCancelTicketRequiresRevisionAndReleasesPlayer(t *testing.T) {
 	if _, err := manager.GetTicket("player-a"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Get cancelled = %v, want not found", err)
 	}
-	if _, err := manager.Create("player-a", CreateRequest{Visibility: VisibilityPublic, QueueKey: "duel", Capacity: 2}); err != nil {
+	if _, err := manager.CreateLobby("player-a", CreateLobbyRequest{Visibility: VisibilityPublic, QueueKey: "duel", Capacity: 2}); err != nil {
 		t.Fatalf("Create after cancel: %v", err)
 	}
 }
 
 func TestMatchedTicketCannotBeCancelled(t *testing.T) {
 	manager, _, _ := newLobbyFixture(t)
-	first, _ := manager.Enqueue("player-a", EnqueueRequest{QueueKey: "duel", Capacity: 2})
-	_, _ = manager.Enqueue("player-b", EnqueueRequest{QueueKey: "duel", Capacity: 2})
+	first, _ := manager.CreateTicket("player-a", CreateTicketRequest{QueueKey: "duel", Capacity: 2})
+	_, _ = manager.CreateTicket("player-b", CreateTicketRequest{QueueKey: "duel", Capacity: 2})
 	matched, err := manager.GetTicket("player-a")
 	if err != nil {
 		t.Fatalf("Get matched: %v", err)
@@ -128,9 +128,9 @@ func TestMatchedTicketCannotBeCancelled(t *testing.T) {
 
 func TestTicketAuthorityExpiresAtExactDeadline(t *testing.T) {
 	manager, _, fakeClock := newLobbyFixture(t)
-	ticket, err := manager.Enqueue("player-a", EnqueueRequest{QueueKey: "duel", Capacity: 2})
+	ticket, err := manager.CreateTicket("player-a", CreateTicketRequest{QueueKey: "duel", Capacity: 2})
 	if err != nil {
-		t.Fatalf("Enqueue: %v", err)
+		t.Fatalf("CreateTicket: %v", err)
 	}
 	fakeClock.advance(TicketTTL - time.Nanosecond)
 	if _, err := manager.GetTicket("player-a"); err != nil {
@@ -144,7 +144,7 @@ func TestTicketAuthorityExpiresAtExactDeadline(t *testing.T) {
 	if len(manager.ticketsByPlayer) != 0 {
 		t.Fatalf("expired tickets retained: %d", len(manager.ticketsByPlayer))
 	}
-	if _, err := manager.Create("player-a", CreateRequest{Visibility: VisibilityPublic, QueueKey: "duel", Capacity: 2}); err != nil {
+	if _, err := manager.CreateLobby("player-a", CreateLobbyRequest{Visibility: VisibilityPublic, QueueKey: "duel", Capacity: 2}); err != nil {
 		t.Fatalf("Create after ticket expiry: %v", err)
 	}
 	if ticket.ExpiresAt != lobbyTestWall.Add(TicketTTL) {
@@ -155,12 +155,12 @@ func TestTicketAuthorityExpiresAtExactDeadline(t *testing.T) {
 func TestRelayCapacityFailurePreservesFIFOSelection(t *testing.T) {
 	manager, relayStore, fakeClock := newLimitedLobbyFixture(t)
 	fillRelayStore(t, relayStore, fakeClock.read().Wall)
-	first, err := manager.Enqueue("player-a", EnqueueRequest{QueueKey: "duel", Capacity: 2})
+	first, err := manager.CreateTicket("player-a", CreateTicketRequest{QueueKey: "duel", Capacity: 2})
 	if err != nil {
-		t.Fatalf("first Enqueue: %v", err)
+		t.Fatalf("first CreateTicket: %v", err)
 	}
-	if _, err := manager.Enqueue("player-b", EnqueueRequest{QueueKey: "duel", Capacity: 2}); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("second Enqueue = %v, want unavailable", err)
+	if _, err := manager.CreateTicket("player-b", CreateTicketRequest{QueueKey: "duel", Capacity: 2}); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("second CreateTicket = %v, want unavailable", err)
 	}
 	for _, player := range []string{"player-a", "player-b"} {
 		ticket, getErr := manager.GetTicket(player)
@@ -171,11 +171,11 @@ func TestRelayCapacityFailurePreservesFIFOSelection(t *testing.T) {
 	if err := relayStore.EndRoom("occupied"); err != nil {
 		t.Fatalf("EndRoom occupied: %v", err)
 	}
-	fakeClock.advance(store.DefaultLimits().TombstoneTTL)
+	fakeClock.advance(relayroom.DefaultLimits().TombstoneTTL)
 	relayStore.Expire()
-	third, err := manager.Enqueue("player-c", EnqueueRequest{QueueKey: "duel", Capacity: 2})
+	third, err := manager.CreateTicket("player-c", CreateTicketRequest{QueueKey: "duel", Capacity: 2})
 	if err != nil || third.State != TicketStateQueued {
-		t.Fatalf("third Enqueue = %#v, %v", third, err)
+		t.Fatalf("third CreateTicket = %#v, %v", third, err)
 	}
 	firstMatched, err := manager.GetTicket("player-a")
 	if err != nil || firstMatched.State != TicketStateMatched {
@@ -191,7 +191,7 @@ func TestRelayCapacityFailurePreservesFIFOSelection(t *testing.T) {
 	}
 }
 
-func TestConcurrentEnqueueFormsExactNonOverlappingPairs(t *testing.T) {
+func TestConcurrentCreateTicketFormsExactNonOverlappingPairs(t *testing.T) {
 	manager, _, _ := newLobbyFixture(t)
 	const players = 100
 	var wait sync.WaitGroup
@@ -199,8 +199,8 @@ func TestConcurrentEnqueueFormsExactNonOverlappingPairs(t *testing.T) {
 		wait.Add(1)
 		go func(index int) {
 			defer wait.Done()
-			if _, err := manager.Enqueue(playerID(index), EnqueueRequest{QueueKey: "duel", Capacity: 2}); err != nil {
-				t.Errorf("Enqueue %d: %v", index, err)
+			if _, err := manager.CreateTicket(playerID(index), CreateTicketRequest{QueueKey: "duel", Capacity: 2}); err != nil {
+				t.Errorf("CreateTicket %d: %v", index, err)
 			}
 		}(index)
 	}
@@ -233,13 +233,13 @@ func TestConcurrentEnqueueFormsExactNonOverlappingPairs(t *testing.T) {
 
 func TestQuickMatchValidation(t *testing.T) {
 	manager, _, _ := newLobbyFixture(t)
-	for _, request := range []EnqueueRequest{
+	for _, request := range []CreateTicketRequest{
 		{QueueKey: "bad!", Capacity: 2},
 		{QueueKey: "duel", Capacity: 1},
-		{QueueKey: "duel", Capacity: HardMaxMembers + 1},
+		{QueueKey: "duel", Capacity: HardMaxMatchSize + 1},
 	} {
-		if _, err := manager.Enqueue("player-a", request); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("Enqueue(%#v) = %v, want invalid", request, err)
+		if _, err := manager.CreateTicket("player-a", request); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("CreateTicket(%#v) = %v, want invalid", request, err)
 		}
 	}
 	for index := range HardMaxTickets {
@@ -247,14 +247,14 @@ func TestQuickMatchValidation(t *testing.T) {
 			id: fmt.Sprintf("ticket-%04d", index), state: TicketStateQueued, monoDeadline: time.Hour,
 		}
 	}
-	if _, err := manager.Enqueue("capacity-player", EnqueueRequest{QueueKey: "duel", Capacity: 2}); !errors.Is(err, ErrCapacity) {
-		t.Fatalf("Enqueue at hard maximum = %v, want capacity", err)
+	if _, err := manager.CreateTicket("capacity-player", CreateTicketRequest{QueueKey: "duel", Capacity: 2}); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("CreateTicket at hard maximum = %v, want capacity", err)
 	}
 }
 
 func TestQuickMatchFatalRandomLeavesSelectedTicketsQueued(t *testing.T) {
 	fakeClock := &lobbyTestClock{wall: lobbyTestWall}
-	relayStore, err := store.New(store.Config{Limits: store.DefaultLimits(), Now: fakeClock.read, Random: &incrementingReader{next: 0xa000}})
+	relayStore, err := relayroom.New(relayroom.Config{Limits: relayroom.DefaultLimits(), Now: fakeClock.read, Random: &incrementingReader{next: 0xa000}})
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
@@ -263,11 +263,11 @@ func TestQuickMatchFatalRandomLeavesSelectedTicketsQueued(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if _, err := manager.Enqueue("player-a", EnqueueRequest{QueueKey: "duel", Capacity: 2}); err != nil {
-		t.Fatalf("first Enqueue: %v", err)
+	if _, err := manager.CreateTicket("player-a", CreateTicketRequest{QueueKey: "duel", Capacity: 2}); err != nil {
+		t.Fatalf("first CreateTicket: %v", err)
 	}
-	if _, err := manager.Enqueue("player-b", EnqueueRequest{QueueKey: "duel", Capacity: 2}); !errors.Is(err, ErrFatalRandom) {
-		t.Fatalf("second Enqueue = %v, want fatal random", err)
+	if _, err := manager.CreateTicket("player-b", CreateTicketRequest{QueueKey: "duel", Capacity: 2}); !errors.Is(err, ErrFatalRandom) {
+		t.Fatalf("second CreateTicket = %v, want fatal random", err)
 	}
 	for _, player := range []string{"player-a", "player-b"} {
 		ticket, getErr := manager.GetTicket(player)
@@ -277,12 +277,12 @@ func TestQuickMatchFatalRandomLeavesSelectedTicketsQueued(t *testing.T) {
 	}
 }
 
-func newLimitedLobbyFixture(t *testing.T) (*Manager, *store.Store, *lobbyTestClock) {
+func newLimitedLobbyFixture(t *testing.T) (*Manager, *relayroom.Store, *lobbyTestClock) {
 	t.Helper()
 	fakeClock := &lobbyTestClock{wall: lobbyTestWall}
-	limits := store.DefaultLimits()
+	limits := relayroom.DefaultLimits()
 	limits.MaxOpenRooms = 1
-	relayStore, err := store.New(store.Config{Limits: limits, Now: fakeClock.read, Random: &incrementingReader{next: 0x9000}})
+	relayStore, err := relayroom.New(relayroom.Config{Limits: limits, Now: fakeClock.read, Random: &incrementingReader{next: 0x9000}})
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
@@ -293,12 +293,12 @@ func newLimitedLobbyFixture(t *testing.T) (*Manager, *store.Store, *lobbyTestClo
 	return manager, relayStore, fakeClock
 }
 
-func fillRelayStore(t *testing.T, relayStore *store.Store, now time.Time) {
+func fillRelayStore(t *testing.T, relayStore *relayroom.Store, now time.Time) {
 	t.Helper()
-	_, _, err := relayStore.CreateRoom("occupied", store.RoomDefinition{
+	_, _, err := relayStore.CreateRoom("occupied", relayroom.RoomSpec{
 		Capacity:  2,
 		ExpiresAt: now.Add(time.Hour),
-		Participants: []store.ParticipantDefinition{
+		Participants: []relayroom.ParticipantSpec{
 			{ParticipantID: "occupied-a", SessionID: "occupied-session-a", GrantExpiresAt: now.Add(time.Hour)},
 			{ParticipantID: "occupied-b", SessionID: "occupied-session-b", GrantExpiresAt: now.Add(time.Hour)},
 		},

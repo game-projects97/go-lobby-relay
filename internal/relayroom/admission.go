@@ -1,4 +1,4 @@
-package store
+package relayroom
 
 import (
 	"math"
@@ -69,7 +69,7 @@ func (admitted AdmittedClientData) SessionID() string           { return admitte
 func (admitted AdmittedClientData) SenderParticipantID() string { return admitted.senderParticipantID }
 func (admitted AdmittedClientData) Sequence() uint64            { return admitted.sequence }
 
-type RelayPlan struct {
+type FanoutPlan struct {
 	RoomID, SessionID   string
 	SenderParticipantID string
 	Sequence            uint64
@@ -123,7 +123,7 @@ func (store *Store) AdmitPreauth(request PreauthRequest) RejectReason {
 	return store.admitPreauthLocked(request.Endpoint, request.InputBytes, store.now().Mono)
 }
 
-func (store *Store) AdmitClientIngress(request ClientDataRequest, inputBytes int) (AdmittedClientData, RejectReason) {
+func (store *Store) AdmitClientData(request ClientDataRequest, inputBytes int) (AdmittedClientData, RejectReason) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	reading := store.now()
@@ -160,30 +160,30 @@ func (store *Store) AdmitPing(request PingRequest, inputBytes int) RejectReason 
 	return reason
 }
 
-func (store *Store) AdmitFanout(admitted AdmittedClientData, outputBytes int) (RelayPlan, RejectReason) {
+func (store *Store) PlanFanout(admitted AdmittedClientData, outputBytes int) (FanoutPlan, RejectReason) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if admitted.store != store {
-		return RelayPlan{}, RejectNotBound
+		return FanoutPlan{}, RejectNotBound
 	}
 	reading := store.now()
 	grant := store.bindingsByID[admitted.bindingID]
 	if grant == nil || grant.binding == nil || grant.binding.id != admitted.bindingID ||
 		grant.binding.generation != admitted.bindingGeneration || grant.roomID != admitted.roomID ||
 		grant.sessionID != admitted.sessionID || grant.participantID != admitted.senderParticipantID {
-		return RelayPlan{}, RejectNotBound
+		return FanoutPlan{}, RejectNotBound
 	}
 	room, reason := store.liveAuthority(grant, reading.Mono)
 	if reason != RejectNone {
-		return RelayPlan{}, reason
+		return FanoutPlan{}, reason
 	}
 	binding := grant.binding
 	if binding == nil || reading.Mono >= binding.deadline {
 		store.clearBinding(grant)
-		return RelayPlan{}, RejectExpired
+		return FanoutPlan{}, RejectExpired
 	}
 	if outputBytes < 0 || outputBytes > protocol.MaxDatagramBytes {
-		return RelayPlan{}, RejectOversized
+		return FanoutPlan{}, RejectOversized
 	}
 
 	recipients := make([]netip.AddrPort, 0, len(room.grants)-1)
@@ -195,12 +195,12 @@ func (store *Store) AdmitFanout(admitted AdmittedClientData, outputBytes int) (R
 			store.terminalGrant(recipient, GrantStateExpired)
 			continue
 		}
-		store.expireRelay(recipient, reading.Mono)
+		store.expireRelayState(recipient, reading.Mono)
 		if recipient.binding != nil {
 			recipients = append(recipients, recipient.binding.endpoint)
 		}
 	}
-	plan := RelayPlan{
+	plan := FanoutPlan{
 		RoomID: grant.roomID, SessionID: grant.sessionID, SenderParticipantID: grant.participantID,
 		Sequence: admitted.sequence, Recipients: recipients,
 	}
@@ -208,7 +208,7 @@ func (store *Store) AdmitFanout(admitted AdmittedClientData, outputBytes int) (R
 		return plan, RejectNone
 	}
 	if outputBytes > math.MaxInt/len(recipients) {
-		return RelayPlan{}, RejectOversized
+		return FanoutPlan{}, RejectOversized
 	}
 	plannedBytes := outputBytes * len(recipients)
 	if !allowAtomic(limiterTime(reading.Mono),
@@ -217,7 +217,7 @@ func (store *Store) AdmitFanout(admitted AdmittedClientData, outputBytes int) (R
 		limiterCharge{store.globalFanoutWrites, len(recipients)},
 		limiterCharge{store.globalFanoutBytes, plannedBytes},
 	) {
-		return RelayPlan{}, RejectFanoutLimited
+		return FanoutPlan{}, RejectFanoutLimited
 	}
 	return plan, RejectNone
 }

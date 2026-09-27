@@ -1,4 +1,4 @@
-package lobby
+package matchmaking
 
 import (
 	"math"
@@ -22,7 +22,7 @@ const (
 	TicketStateExpired   TicketState = "expired"
 )
 
-type EnqueueRequest struct {
+type CreateTicketRequest struct {
 	QueueKey string
 	Capacity uint32
 }
@@ -46,8 +46,8 @@ type ticketRecord struct {
 	assignment             *Assignment
 }
 
-func (manager *Manager) Enqueue(playerID string, request EnqueueRequest) (TicketSnapshot, error) {
-	if !protocol.ValidID(playerID) || !validEnqueueRequest(request) {
+func (manager *Manager) CreateTicket(playerID string, request CreateTicketRequest) (TicketSnapshot, error) {
+	if !protocol.ValidID(playerID) || !validCreateTicketRequest(request) {
 		return TicketSnapshot{}, ErrInvalid
 	}
 	manager.mu.Lock()
@@ -84,9 +84,9 @@ func (manager *Manager) Enqueue(playerID string, request EnqueueRequest) (Ticket
 		expiresAt: reading.Wall.UTC().Add(TicketTTL), monoDeadline: deadline,
 	}
 	manager.ticketsByPlayer[playerID] = record
-	key := queueKey{queueKey: request.QueueKey, capacity: request.Capacity}
-	manager.queues[key] = append(manager.queues[key], playerID)
-	if err := manager.matchQueueLocked(key, reading); err != nil {
+	bucket := queueBucket{queueKey: request.QueueKey, capacity: request.Capacity}
+	manager.queues[bucket] = append(manager.queues[bucket], playerID)
+	if err := manager.matchQueueLocked(bucket, reading); err != nil {
 		return TicketSnapshot{}, err
 	}
 	return ticketSnapshot(record), nil
@@ -124,12 +124,12 @@ func (manager *Manager) CancelTicket(playerID string, revision uint64) (TicketSn
 	record.revision++
 	snapshot := ticketSnapshot(record)
 	delete(manager.ticketsByPlayer, playerID)
-	manager.removeQueuedPlayerLocked(queueKey{queueKey: record.queueKey, capacity: record.capacity}, playerID)
+	manager.removeQueuedPlayerLocked(queueBucket{queueKey: record.queueKey, capacity: record.capacity}, playerID)
 	return snapshot, nil
 }
 
-func validEnqueueRequest(request EnqueueRequest) bool {
-	return protocol.ValidID(request.QueueKey) && request.Capacity >= 2 && request.Capacity <= HardMaxMembers
+func validCreateTicketRequest(request CreateTicketRequest) bool {
+	return protocol.ValidID(request.QueueKey) && request.Capacity >= 2 && request.Capacity <= HardMaxMatchSize
 }
 
 func (manager *Manager) expireTicketsLocked(reading clock.Reading) {
@@ -138,7 +138,7 @@ func (manager *Manager) expireTicketsLocked(reading clock.Reading) {
 			continue
 		}
 		if ticket.state == TicketStateQueued {
-			manager.removeQueuedPlayerLocked(queueKey{queueKey: ticket.queueKey, capacity: ticket.capacity}, playerID)
+			manager.removeQueuedPlayerLocked(queueBucket{queueKey: ticket.queueKey, capacity: ticket.capacity}, playerID)
 		}
 		if ticket.state == TicketStateMatched && ticket.assignment != nil {
 			_ = manager.rooms.EndRoom(ticket.assignment.RoomID)

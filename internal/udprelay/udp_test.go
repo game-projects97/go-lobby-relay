@@ -1,4 +1,4 @@
-package relay
+package udprelay
 
 import (
 	"bytes"
@@ -20,7 +20,7 @@ import (
 	relayv1 "github.com/gyungsubLee/go-lobby-relay/gen/go/relay/v1"
 	"github.com/gyungsubLee/go-lobby-relay/internal/clock"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
-	"github.com/gyungsubLee/go-lobby-relay/internal/store"
+	"github.com/gyungsubLee/go-lobby-relay/internal/relayroom"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -154,7 +154,7 @@ func (reader *deterministicReader) fail(err error) {
 }
 
 type storeFixture struct {
-	store     *store.Store
+	store     *relayroom.Store
 	fakeClock *testClock
 	random    *deterministicReader
 }
@@ -166,59 +166,59 @@ type testClient struct {
 	endpoint                         netip.AddrPort
 }
 
-func newStoreFixture(t testing.TB, limits store.Limits) *storeFixture {
+func newStoreFixture(t testing.TB, limits relayroom.Limits) *storeFixture {
 	t.Helper()
 	fakeClock := &testClock{reading: clock.Reading{Wall: time.Now().UTC().Add(time.Minute)}}
 	random := &deterministicReader{}
-	rooms, err := store.New(store.Config{Limits: limits, Now: fakeClock.now, Random: random})
+	rooms, err := relayroom.New(relayroom.Config{Limits: limits, Now: fakeClock.now, Random: random})
 	if err != nil {
 		t.Fatalf("store.New(): %v", err)
 	}
 	return &storeFixture{store: rooms, fakeClock: fakeClock, random: random}
 }
 
-func (fixture *storeFixture) addRoom(t testing.TB, roomID string, participants int) store.Allocation {
+func (fixture *storeFixture) addRoom(t testing.TB, roomID string, participants int) relayroom.RoomAllocation {
 	t.Helper()
 	now := fixture.fakeClock.now().Wall
-	definition := store.RoomDefinition{
+	roomSpec := relayroom.RoomSpec{
 		Capacity: uint32(participants), ExpiresAt: now.Add(time.Hour),
-		Participants: make([]store.ParticipantDefinition, participants),
+		Participants: make([]relayroom.ParticipantSpec, participants),
 	}
-	for index := range definition.Participants {
-		definition.Participants[index] = store.ParticipantDefinition{
+	for index := range roomSpec.Participants {
+		roomSpec.Participants[index] = relayroom.ParticipantSpec{
 			ParticipantID:  roomID + "-participant-" + string(rune('a'+index)),
 			SessionID:      roomID + "-session-" + string(rune('a'+index)),
 			GrantExpiresAt: now.Add(30 * time.Minute),
 		}
 	}
-	allocation, created, err := fixture.store.CreateRoom(roomID, definition)
+	allocation, created, err := fixture.store.CreateRoom(roomID, roomSpec)
 	if err != nil || !created {
 		t.Fatalf("CreateRoom(%q) = (_, %t, %v)", roomID, created, err)
 	}
 	return allocation
 }
 
-func (fixture *storeFixture) bindDirect(t testing.TB, roomID string, grant store.GrantAllocation, endpoint netip.AddrPort, nonceByte byte) testClient {
+func (fixture *storeFixture) bindDirect(t testing.TB, roomID string, grant relayroom.ParticipantGrant, endpoint netip.AddrPort, nonceByte byte) testClient {
 	t.Helper()
 	nonce := filled16(nonceByte)
-	challenge, reason := fixture.store.BeginChallenge(store.ChallengeRequest{
+	challenge, reason := fixture.store.AdmitHello(relayroom.HelloRequest{
 		RoomID: roomID, SessionID: grant.SessionID, GrantID: grant.GrantID,
 		ClientNonce: nonce, Endpoint: endpoint, InputBytes: protocol.MinHelloBytes,
 	})
-	if reason != store.RejectNone {
-		t.Fatalf("BeginChallenge(%q): %q", grant.SessionID, reason)
+	if reason != relayroom.RejectNone {
+		t.Fatalf("AdmitHello(%q): %q", grant.SessionID, reason)
 	}
 	secret := *grant.GrantSecret
 	key := protocol.BindingKey(secret, protocol.Revision, roomID, grant.SessionID, grant.GrantID,
 		challenge.CandidateID, nonce, challenge.ServerNonce)
-	bound, reason := fixture.store.Authenticate(store.AuthenticateRequest{
+	bound, reason := fixture.store.AdmitAuth(relayroom.AuthRequest{
 		RoomID: roomID, SessionID: grant.SessionID, CandidateID: challenge.CandidateID,
 		Endpoint: endpoint, InputBytes: 100,
 		AuthTag: protocol.AuthTag(secret, protocol.Revision, roomID, grant.SessionID, grant.GrantID,
 			challenge.CandidateID, nonce, challenge.ServerNonce),
 	})
-	if reason != store.RejectNone {
-		t.Fatalf("Authenticate(%q): %q", grant.SessionID, reason)
+	if reason != relayroom.RejectNone {
+		t.Fatalf("AdmitAuth(%q): %q", grant.SessionID, reason)
 	}
 	return testClient{
 		roomID: roomID, participantID: grant.ParticipantID, sessionID: grant.SessionID,
@@ -250,12 +250,12 @@ func (client testClient) ping(sequence uint64) []byte {
 }
 
 func TestNewValidatesConfigurationAndOwnsSocketOnlyOnSuccess(t *testing.T) {
-	fixture := newStoreFixture(t, store.DefaultLimits())
+	fixture := newStoreFixture(t, relayroom.DefaultLimits())
 	socket := new(fakeSocket)
 	for _, test := range []struct {
 		name   string
 		socket udpSocket
-		rooms  *store.Store
+		rooms  *relayroom.Store
 		config Config
 	}{
 		{"nil socket", nil, fixture.store, Config{}},
@@ -292,7 +292,7 @@ func TestNewValidatesConfigurationAndOwnsSocketOnlyOnSuccess(t *testing.T) {
 }
 
 func TestDispatchHandlesEveryPacketKindAndReusesOneFanoutEncoding(t *testing.T) {
-	fixture := newStoreFixture(t, store.DefaultLimits())
+	fixture := newStoreFixture(t, relayroom.DefaultLimits())
 	allocation := fixture.addRoom(t, "room", 3)
 	socket := new(fakeSocket)
 	deadlineNow := time.Now().Add(time.Minute)
@@ -309,7 +309,7 @@ func TestDispatchHandlesEveryPacketKindAndReusesOneFanoutEncoding(t *testing.T) 
 	senderEndpoint := netip.MustParseAddrPort("192.0.2.10:4000")
 	clientNonce := filled16(0x81)
 	hello := helloDatagram("room", allocation.Grants[0].SessionID, allocation.Grants[0].GrantID, clientNonce)
-	if err := relay.dispatch(hello, senderEndpoint); err != nil {
+	if err := relay.handleDatagram(hello, senderEndpoint); err != nil {
 		t.Fatalf("dispatch(HELLO): %v", err)
 	}
 	writes, _, events, _ := socket.snapshot()
@@ -335,7 +335,7 @@ func TestDispatchHandlesEveryPacketKindAndReusesOneFanoutEncoding(t *testing.T) 
 		SessionId: allocation.Grants[0].SessionID,
 		Body:      &relayv1.Envelope_Auth{Auth: &relayv1.Auth{CandidateId: candidateID[:]}},
 	})
-	if err := relay.dispatch(auth, senderEndpoint); err != nil {
+	if err := relay.handleDatagram(auth, senderEndpoint); err != nil {
 		t.Fatalf("dispatch(AUTH): %v", err)
 	}
 	writes, deadlines, events, _ := socket.snapshot()
@@ -367,7 +367,7 @@ func TestDispatchHandlesEveryPacketKindAndReusesOneFanoutEncoding(t *testing.T) 
 		bindingID: bindingID, secret: secret, key: key, endpoint: senderEndpoint,
 	}
 	payload := []byte("payload-sentinel-8fc50c2d")
-	if err := relay.dispatch(sender.data(1, payload), senderEndpoint); err != nil {
+	if err := relay.handleDatagram(sender.data(1, payload), senderEndpoint); err != nil {
 		t.Fatalf("dispatch(ClientData): %v", err)
 	}
 	writes, deadlines, events, _ = socket.snapshot()
@@ -397,7 +397,7 @@ func TestDispatchHandlesEveryPacketKindAndReusesOneFanoutEncoding(t *testing.T) 
 
 	beforeWrites := len(writes)
 	beforeDeadlines := len(deadlines)
-	if err := relay.dispatch(sender.ping(2), senderEndpoint); err != nil {
+	if err := relay.handleDatagram(sender.ping(2), senderEndpoint); err != nil {
 		t.Fatalf("dispatch(Ping): %v", err)
 	}
 	writes, deadlines, _, _ = socket.snapshot()
@@ -417,7 +417,7 @@ func TestDispatchEmitsHandshakeIndependentOfHostWall(t *testing.T) {
 		time.Date(2100, time.January, 1, 0, 0, 0, 0, time.UTC),
 	} {
 		t.Run(wall.Format("2006"), func(t *testing.T) {
-			fixture := newStoreFixture(t, store.DefaultLimits())
+			fixture := newStoreFixture(t, relayroom.DefaultLimits())
 			fixture.fakeClock.reading = clock.Reading{Wall: wall}
 			allocation := fixture.addRoom(t, "room", 1)
 			socket := new(fakeSocket)
@@ -430,7 +430,7 @@ func TestDispatchEmitsHandshakeIndependentOfHostWall(t *testing.T) {
 			endpoint := netip.MustParseAddrPort("192.0.2.99:4999")
 			nonce := filled16(0x91)
 			hello := helloDatagram("room", allocation.Grants[0].SessionID, allocation.Grants[0].GrantID, nonce)
-			if err := relay.dispatch(hello, endpoint); err != nil {
+			if err := relay.handleDatagram(hello, endpoint); err != nil {
 				t.Fatalf("dispatch(HELLO): %v", err)
 			}
 			writes, _, _, _ := socket.snapshot()
@@ -448,7 +448,7 @@ func TestDispatchEmitsHandshakeIndependentOfHostWall(t *testing.T) {
 				AuthTag: authTag[:],
 				Body:    &relayv1.Envelope_Auth{Auth: &relayv1.Auth{CandidateId: candidateID[:]}},
 			})
-			if err := relay.dispatch(auth, endpoint); err != nil {
+			if err := relay.handleDatagram(auth, endpoint); err != nil {
 				t.Fatalf("dispatch(AUTH): %v", err)
 			}
 			writes, _, _, _ = socket.snapshot()
@@ -462,94 +462,94 @@ func TestDispatchEmitsHandshakeIndependentOfHostWall(t *testing.T) {
 func TestDispatchClassifiesFixedDropReasonsExactlyOnce(t *testing.T) {
 	tests := []struct {
 		name string
-		want store.RejectReason
-		run  func(testing.TB, *Relay, *fakeSocket, *storeFixture)
+		want relayroom.RejectReason
+		run  func(testing.TB, *Server, *fakeSocket, *storeFixture)
 	}{
-		{"malformed", store.RejectMalformed, func(_ testing.TB, relay *Relay, _ *fakeSocket, _ *storeFixture) {
-			_ = relay.dispatch([]byte{0xff}, netip.MustParseAddrPort("192.0.2.1:4000"))
+		{"malformed", relayroom.RejectMalformed, func(_ testing.TB, relay *Server, _ *fakeSocket, _ *storeFixture) {
+			_ = relay.handleDatagram([]byte{0xff}, netip.MustParseAddrPort("192.0.2.1:4000"))
 		}},
-		{"oversized", store.RejectOversized, func(_ testing.TB, relay *Relay, _ *fakeSocket, _ *storeFixture) {
-			_ = relay.dispatch(make([]byte, protocol.MaxDatagramBytes+1), netip.MustParseAddrPort("192.0.2.2:4000"))
+		{"oversized", relayroom.RejectOversized, func(_ testing.TB, relay *Server, _ *fakeSocket, _ *storeFixture) {
+			_ = relay.handleDatagram(make([]byte, protocol.MaxDatagramBytes+1), netip.MustParseAddrPort("192.0.2.2:4000"))
 		}},
-		{"unsupported_version", store.RejectUnsupportedVersion, func(_ testing.TB, relay *Relay, _ *fakeSocket, _ *storeFixture) {
+		{"unsupported_version", relayroom.RejectUnsupportedVersion, func(_ testing.TB, relay *Server, _ *fakeSocket, _ *storeFixture) {
 			wire := marshalClient(&relayv1.Envelope{ProtocolRevision: protocol.Revision + 1, RoomId: "room", SessionId: "session"})
-			_ = relay.dispatch(wire, netip.MustParseAddrPort("192.0.2.3:4000"))
+			_ = relay.handleDatagram(wire, netip.MustParseAddrPort("192.0.2.3:4000"))
 		}},
-		{"unknown_grant", store.RejectUnknownGrant, func(_ testing.TB, relay *Relay, _ *fakeSocket, _ *storeFixture) {
-			_ = relay.dispatch(helloDatagram("room", "session", filled16(0xee), filled16(0xef)),
+		{"unknown_grant", relayroom.RejectUnknownGrant, func(_ testing.TB, relay *Server, _ *fakeSocket, _ *storeFixture) {
+			_ = relay.handleDatagram(helloDatagram("room", "session", filled16(0xee), filled16(0xef)),
 				netip.MustParseAddrPort("192.0.2.4:4000"))
 		}},
-		{"auth_failed", store.RejectAuthFailed, func(_ testing.TB, relay *Relay, _ *fakeSocket, _ *storeFixture) {
+		{"auth_failed", relayroom.RejectAuthFailed, func(_ testing.TB, relay *Server, _ *fakeSocket, _ *storeFixture) {
 			wire := marshalClient(&relayv1.Envelope{
 				ProtocolRevision: protocol.Revision, RoomId: "room", SessionId: "session", AuthTag: make([]byte, 32),
 				Body: &relayv1.Envelope_Auth{Auth: &relayv1.Auth{CandidateId: make([]byte, 16)}},
 			})
-			_ = relay.dispatch(wire, netip.MustParseAddrPort("192.0.2.5:4000"))
+			_ = relay.handleDatagram(wire, netip.MustParseAddrPort("192.0.2.5:4000"))
 		}},
-		{"not_bound", store.RejectNotBound, func(_ testing.TB, relay *Relay, _ *fakeSocket, _ *storeFixture) {
+		{"not_bound", relayroom.RejectNotBound, func(_ testing.TB, relay *Server, _ *fakeSocket, _ *storeFixture) {
 			wire := marshalClient(&relayv1.Envelope{
 				ProtocolRevision: protocol.Revision, Sequence: 1, RoomId: "room", SessionId: "session", AuthTag: make([]byte, 32),
 				Body: &relayv1.Envelope_Ping{Ping: &relayv1.Ping{BindingId: make([]byte, 16)}},
 			})
-			_ = relay.dispatch(wire, netip.MustParseAddrPort("192.0.2.6:4000"))
+			_ = relay.handleDatagram(wire, netip.MustParseAddrPort("192.0.2.6:4000"))
 		}},
-		{"wrong_room", store.RejectWrongRoom, func(t testing.TB, relay *Relay, _ *fakeSocket, fixture *storeFixture) {
+		{"wrong_room", relayroom.RejectWrongRoom, func(t testing.TB, relay *Server, _ *fakeSocket, fixture *storeFixture) {
 			allocation := fixture.addRoom(t, "room", 1)
 			client := fixture.bindDirect(t, "room", allocation.Grants[0], netip.MustParseAddrPort("192.0.2.7:4000"), 0x51)
 			wire := unmarshalEnvelope(t, client.ping(1))
 			wire.RoomId = "other-room"
-			_ = relay.dispatch(marshalClient(wire), client.endpoint)
+			_ = relay.handleDatagram(marshalClient(wire), client.endpoint)
 		}},
-		{"wrong_endpoint", store.RejectWrongEndpoint, func(t testing.TB, relay *Relay, _ *fakeSocket, fixture *storeFixture) {
+		{"wrong_endpoint", relayroom.RejectWrongEndpoint, func(t testing.TB, relay *Server, _ *fakeSocket, fixture *storeFixture) {
 			allocation := fixture.addRoom(t, "room", 1)
 			client := fixture.bindDirect(t, "room", allocation.Grants[0], netip.MustParseAddrPort("192.0.2.8:4000"), 0x52)
-			_ = relay.dispatch(client.ping(1), netip.MustParseAddrPort("192.0.2.88:4888"))
+			_ = relay.handleDatagram(client.ping(1), netip.MustParseAddrPort("192.0.2.88:4888"))
 		}},
-		{"bad_hmac", store.RejectAuthFailed, func(t testing.TB, relay *Relay, _ *fakeSocket, fixture *storeFixture) {
+		{"bad_hmac", relayroom.RejectAuthFailed, func(t testing.TB, relay *Server, _ *fakeSocket, fixture *storeFixture) {
 			allocation := fixture.addRoom(t, "room", 1)
 			client := fixture.bindDirect(t, "room", allocation.Grants[0], netip.MustParseAddrPort("192.0.2.9:4000"), 0x53)
 			wire := unmarshalEnvelope(t, client.ping(1))
 			wire.AuthTag[0] ^= 1
-			_ = relay.dispatch(marshalClient(wire), client.endpoint)
+			_ = relay.handleDatagram(marshalClient(wire), client.endpoint)
 		}},
-		{"replay", store.RejectReplay, func(t testing.TB, relay *Relay, _ *fakeSocket, fixture *storeFixture) {
+		{"replay", relayroom.RejectReplay, func(t testing.TB, relay *Server, _ *fakeSocket, fixture *storeFixture) {
 			allocation := fixture.addRoom(t, "room", 1)
 			client := fixture.bindDirect(t, "room", allocation.Grants[0], netip.MustParseAddrPort("192.0.2.10:4000"), 0x54)
 			wire := client.ping(1)
-			if err := relay.dispatch(wire, client.endpoint); err != nil {
+			if err := relay.handleDatagram(wire, client.endpoint); err != nil {
 				t.Fatalf("first Ping: %v", err)
 			}
-			_ = relay.dispatch(wire, client.endpoint)
+			_ = relay.handleDatagram(wire, client.endpoint)
 		}},
-		{"expired", store.RejectExpired, func(t testing.TB, relay *Relay, _ *fakeSocket, fixture *storeFixture) {
+		{"expired", relayroom.RejectExpired, func(t testing.TB, relay *Server, _ *fakeSocket, fixture *storeFixture) {
 			allocation := fixture.addRoom(t, "room", 1)
 			client := fixture.bindDirect(t, "room", allocation.Grants[0], netip.MustParseAddrPort("192.0.2.11:4000"), 0x55)
-			fixture.fakeClock.set(store.HardMaxBindingTTL)
-			_ = relay.dispatch(client.ping(1), client.endpoint)
+			fixture.fakeClock.set(relayroom.HardMaxBindingTTL)
+			_ = relay.handleDatagram(client.ping(1), client.endpoint)
 		}},
-		{"rate_limited", store.RejectRateLimited, func(_ testing.TB, relay *Relay, _ *fakeSocket, fixture *storeFixture) {
+		{"rate_limited", relayroom.RejectRateLimited, func(_ testing.TB, relay *Server, _ *fakeSocket, fixture *storeFixture) {
 			endpoint := netip.MustParseAddrPort("192.0.2.12:4000")
-			_ = fixture.store.AdmitPreauth(store.PreauthRequest{Endpoint: endpoint, InputBytes: 1})
-			_ = relay.dispatch([]byte{0xff}, endpoint)
+			_ = fixture.store.AdmitPreauth(relayroom.PreauthRequest{Endpoint: endpoint, InputBytes: 1})
+			_ = relay.handleDatagram([]byte{0xff}, endpoint)
 		}},
-		{"fanout_limited", store.RejectFanoutLimited, func(t testing.TB, relay *Relay, _ *fakeSocket, fixture *storeFixture) {
+		{"fanout_limited", relayroom.RejectFanoutLimited, func(t testing.TB, relay *Server, _ *fakeSocket, fixture *storeFixture) {
 			allocation := fixture.addRoom(t, "room", 3)
 			clients := make([]testClient, 3)
 			for index := range clients {
 				clients[index] = fixture.bindDirect(t, "room", allocation.Grants[index],
 					netip.MustParseAddrPort("192.0.2."+string(rune('1'+index))+":4100"), byte(0x60+index))
 			}
-			_ = relay.dispatch(clients[0].data(1, nil), clients[0].endpoint)
+			_ = relay.handleDatagram(clients[0].data(1, nil), clients[0].endpoint)
 		}},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			limits := store.DefaultLimits()
-			if test.want == store.RejectRateLimited {
+			limits := relayroom.DefaultLimits()
+			if test.want == relayroom.RejectRateLimited {
 				limits.PreauthSourcePacketRate, limits.PreauthSourcePacketBurst = 1, 1
 			}
-			if test.want == store.RejectFanoutLimited {
+			if test.want == relayroom.RejectFanoutLimited {
 				limits.RoomFanoutWriteRate, limits.RoomFanoutWriteBurst = 1, 1
 			}
 			fixture := newStoreFixture(t, limits)
@@ -576,29 +576,29 @@ func TestDispatchClassifiesFixedDropReasonsExactlyOnce(t *testing.T) {
 func TestDispatchClassifiesRetiredCredentialsAfterEndRoom(t *testing.T) {
 	tests := []struct {
 		name    string
-		want    store.RejectReason
-		prepare func(testing.TB, *storeFixture, store.Allocation) ([]byte, netip.AddrPort)
+		want    relayroom.RejectReason
+		prepare func(testing.TB, *storeFixture, relayroom.RoomAllocation) ([]byte, netip.AddrPort)
 	}{
 		{
 			name: "HELLO is unknown_grant",
-			want: store.RejectUnknownGrant,
-			prepare: func(_ testing.TB, _ *storeFixture, allocation store.Allocation) ([]byte, netip.AddrPort) {
+			want: relayroom.RejectUnknownGrant,
+			prepare: func(_ testing.TB, _ *storeFixture, allocation relayroom.RoomAllocation) ([]byte, netip.AddrPort) {
 				return helloDatagram("room", allocation.Grants[0].SessionID, allocation.Grants[0].GrantID, filled16(0xa1)),
 					netip.MustParseAddrPort("192.0.2.101:4101")
 			},
 		},
 		{
 			name: "AUTH is auth_failed",
-			want: store.RejectAuthFailed,
-			prepare: func(t testing.TB, fixture *storeFixture, allocation store.Allocation) ([]byte, netip.AddrPort) {
+			want: relayroom.RejectAuthFailed,
+			prepare: func(t testing.TB, fixture *storeFixture, allocation relayroom.RoomAllocation) ([]byte, netip.AddrPort) {
 				endpoint := netip.MustParseAddrPort("192.0.2.102:4102")
 				nonce := filled16(0xa2)
-				challenge, reason := fixture.store.BeginChallenge(store.ChallengeRequest{
+				challenge, reason := fixture.store.AdmitHello(relayroom.HelloRequest{
 					RoomID: "room", SessionID: allocation.Grants[0].SessionID, GrantID: allocation.Grants[0].GrantID,
 					ClientNonce: nonce, Endpoint: endpoint, InputBytes: protocol.MinHelloBytes,
 				})
-				if reason != store.RejectNone {
-					t.Fatalf("BeginChallenge(): %q", reason)
+				if reason != relayroom.RejectNone {
+					t.Fatalf("AdmitHello(): %q", reason)
 				}
 				secret := *allocation.Grants[0].GrantSecret
 				tag := protocol.AuthTag(secret, protocol.Revision, "room", allocation.Grants[0].SessionID,
@@ -612,16 +612,16 @@ func TestDispatchClassifiesRetiredCredentialsAfterEndRoom(t *testing.T) {
 		},
 		{
 			name: "ClientData is not_bound",
-			want: store.RejectNotBound,
-			prepare: func(t testing.TB, fixture *storeFixture, allocation store.Allocation) ([]byte, netip.AddrPort) {
+			want: relayroom.RejectNotBound,
+			prepare: func(t testing.TB, fixture *storeFixture, allocation relayroom.RoomAllocation) ([]byte, netip.AddrPort) {
 				client := fixture.bindDirect(t, "room", allocation.Grants[0], netip.MustParseAddrPort("192.0.2.103:4103"), 0xa3)
 				return client.data(1, []byte("stale")), client.endpoint
 			},
 		},
 		{
 			name: "Ping is not_bound",
-			want: store.RejectNotBound,
-			prepare: func(t testing.TB, fixture *storeFixture, allocation store.Allocation) ([]byte, netip.AddrPort) {
+			want: relayroom.RejectNotBound,
+			prepare: func(t testing.TB, fixture *storeFixture, allocation relayroom.RoomAllocation) ([]byte, netip.AddrPort) {
 				client := fixture.bindDirect(t, "room", allocation.Grants[0], netip.MustParseAddrPort("192.0.2.104:4104"), 0xa4)
 				return client.ping(1), client.endpoint
 			},
@@ -630,7 +630,7 @@ func TestDispatchClassifiesRetiredCredentialsAfterEndRoom(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newStoreFixture(t, store.DefaultLimits())
+			fixture := newStoreFixture(t, relayroom.DefaultLimits())
 			allocation := fixture.addRoom(t, "room", 1)
 			wire, endpoint := test.prepare(t, fixture, allocation)
 			if err := fixture.store.EndRoom("room"); err != nil {
@@ -643,7 +643,7 @@ func TestDispatchClassifiesRetiredCredentialsAfterEndRoom(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = relay.Close() })
 
-			if err := relay.dispatch(wire, endpoint); err != nil {
+			if err := relay.handleDatagram(wire, endpoint); err != nil {
 				t.Fatalf("dispatch(): %v", err)
 			}
 			counters := relay.Counters()
@@ -655,7 +655,7 @@ func TestDispatchClassifiesRetiredCredentialsAfterEndRoom(t *testing.T) {
 			if len(writes) != 0 || len(deadlines) != 0 {
 				t.Fatalf("retired credential produced output: writes=%d deadlines=%d", len(writes), len(deadlines))
 			}
-			if _, err := fixture.store.GetRoom("room"); !errors.Is(err, store.ErrNotFound) {
+			if _, err := fixture.store.GetRoom("room"); !errors.Is(err, relayroom.ErrNotFound) {
 				t.Fatalf("GetRoom() after stale traffic error = %v, want ErrNotFound", err)
 			}
 		})
@@ -663,22 +663,22 @@ func TestDispatchClassifiesRetiredCredentialsAfterEndRoom(t *testing.T) {
 }
 
 func TestDropCountersCoverEveryFixedReasonAndNeverFatalRandom(t *testing.T) {
-	fixture := newStoreFixture(t, store.DefaultLimits())
+	fixture := newStoreFixture(t, relayroom.DefaultLimits())
 	relay, err := New(new(fakeSocket), fixture.store, Config{})
 	if err != nil {
 		t.Fatalf("New(): %v", err)
 	}
 	t.Cleanup(func() { _ = relay.Close() })
-	reasons := []store.RejectReason{
-		store.RejectMalformed, store.RejectOversized, store.RejectUnsupportedVersion,
-		store.RejectUnknownGrant, store.RejectAuthFailed, store.RejectReplay, store.RejectExpired,
-		store.RejectRevoked, store.RejectWrongRoom, store.RejectWrongEndpoint, store.RejectNotBound,
-		store.RejectRateLimited, store.RejectFanoutLimited, store.RejectDraining,
+	reasons := []relayroom.RejectReason{
+		relayroom.RejectMalformed, relayroom.RejectOversized, relayroom.RejectUnsupportedVersion,
+		relayroom.RejectUnknownGrant, relayroom.RejectAuthFailed, relayroom.RejectReplay, relayroom.RejectExpired,
+		relayroom.RejectRevoked, relayroom.RejectWrongRoom, relayroom.RejectWrongEndpoint, relayroom.RejectNotBound,
+		relayroom.RejectRateLimited, relayroom.RejectFanoutLimited, relayroom.RejectDraining,
 	}
 	for _, reason := range reasons {
 		relay.recordDrop(reason)
 	}
-	relay.recordDrop(store.RejectFatalRandom)
+	relay.recordDrop(relayroom.RejectFatalRandom)
 	counters := relay.Counters()
 	if counters.UDPDropped != uint64(len(reasons)) || dropTotal(counters.DropReasons) != uint64(len(reasons)) {
 		t.Fatalf("fixed drop counters = %#v", counters)
@@ -705,7 +705,7 @@ func TestDispatchWriteFailuresAreSilentBoundedAndNotInputDrops(t *testing.T) {
 		{"second write", func(socket *fakeSocket) { socket.writeErrorAt = 2 }, 2, 1, 1, 2},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newStoreFixture(t, store.DefaultLimits())
+			fixture := newStoreFixture(t, relayroom.DefaultLimits())
 			allocation := fixture.addRoom(t, "room", 3)
 			clients := make([]testClient, 3)
 			for index := range clients {
@@ -719,7 +719,7 @@ func TestDispatchWriteFailuresAreSilentBoundedAndNotInputDrops(t *testing.T) {
 				t.Fatalf("New(): %v", err)
 			}
 			t.Cleanup(func() { _ = relay.Close() })
-			if err := relay.dispatch(clients[0].data(1, []byte("write-failure")), clients[0].endpoint); err != nil {
+			if err := relay.handleDatagram(clients[0].data(1, []byte("write-failure")), clients[0].endpoint); err != nil {
 				t.Fatalf("dispatch(): %v", err)
 			}
 			counters := relay.Counters()
@@ -738,7 +738,7 @@ func TestDispatchWriteFailuresAreSilentBoundedAndNotInputDrops(t *testing.T) {
 
 	for _, failure := range []string{"deadline", "write", "short"} {
 		t.Run("handshake "+failure, func(t *testing.T) {
-			fixture := newStoreFixture(t, store.DefaultLimits())
+			fixture := newStoreFixture(t, relayroom.DefaultLimits())
 			allocation := fixture.addRoom(t, "room", 1)
 			socket := new(fakeSocket)
 			switch failure {
@@ -755,7 +755,7 @@ func TestDispatchWriteFailuresAreSilentBoundedAndNotInputDrops(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = relay.Close() })
 			wire := helloDatagram("room", allocation.Grants[0].SessionID, allocation.Grants[0].GrantID, filled16(0xa1))
-			if err := relay.dispatch(wire, netip.MustParseAddrPort("203.0.113.1:4300")); err != nil {
+			if err := relay.handleDatagram(wire, netip.MustParseAddrPort("203.0.113.1:4300")); err != nil {
 				t.Fatalf("dispatch(HELLO): %v", err)
 			}
 			if counters := relay.Counters(); counters.UDPDropped != 0 {
@@ -766,7 +766,7 @@ func TestDispatchWriteFailuresAreSilentBoundedAndNotInputDrops(t *testing.T) {
 }
 
 func TestRunUsesExactBufferNormalizesSourceAndGuardsImpossibleReadCounts(t *testing.T) {
-	fixture := newStoreFixture(t, store.DefaultLimits())
+	fixture := newStoreFixture(t, relayroom.DefaultLimits())
 	for _, test := range []struct {
 		name string
 		n    int
@@ -821,7 +821,7 @@ func TestRunUsesExactBufferNormalizesSourceAndGuardsImpossibleReadCounts(t *test
 }
 
 func TestDispatchNormalizesMappedSourceBeforeExactEndpointBinding(t *testing.T) {
-	fixture := newStoreFixture(t, store.DefaultLimits())
+	fixture := newStoreFixture(t, relayroom.DefaultLimits())
 	allocation := fixture.addRoom(t, "room", 1)
 	socket := new(fakeSocket)
 	relay, err := New(socket, fixture.store, Config{})
@@ -833,7 +833,7 @@ func TestDispatchNormalizesMappedSourceBeforeExactEndpointBinding(t *testing.T) 
 	endpoint := netip.MustParseAddrPort("192.0.2.45:4450")
 	mapped := netip.AddrPortFrom(netip.AddrFrom16(endpoint.Addr().As16()), endpoint.Port())
 	wire := helloDatagram("room", allocation.Grants[0].SessionID, allocation.Grants[0].GrantID, filled16(0xb2))
-	if err := relay.dispatch(wire, mapped); err != nil {
+	if err := relay.handleDatagram(wire, mapped); err != nil {
 		t.Fatalf("dispatch(): %v", err)
 	}
 	writes, _, _, _ := socket.snapshot()
@@ -843,7 +843,7 @@ func TestDispatchNormalizesMappedSourceBeforeExactEndpointBinding(t *testing.T) 
 }
 
 func TestCloseIsConcurrentIdempotentAndRunLifecycleIsDeterministic(t *testing.T) {
-	fixture := newStoreFixture(t, store.DefaultLimits())
+	fixture := newStoreFixture(t, relayroom.DefaultLimits())
 
 	t.Run("close before run", func(t *testing.T) {
 		socket := new(fakeSocket)
@@ -911,10 +911,10 @@ func (socket *closeSignalSocket) Close() error {
 }
 
 func TestFatalRandomReturnsSafeRunErrorWithoutDropOrDiagnostic(t *testing.T) {
-	limits := store.DefaultLimits()
+	limits := relayroom.DefaultLimits()
 	fakeClock := &testClock{reading: clock.Reading{Wall: time.Now().UTC().Add(time.Minute)}}
 	random := new(deterministicReader)
-	rooms, err := store.New(store.Config{Limits: limits, Now: fakeClock.now, Random: random})
+	rooms, err := relayroom.New(relayroom.Config{Limits: limits, Now: fakeClock.now, Random: random})
 	if err != nil {
 		t.Fatalf("store.New(): %v", err)
 	}
@@ -993,7 +993,7 @@ func TestRelaySourceContainsNoPacketLoggingGoroutineOrQueue(t *testing.T) {
 }
 
 func TestRealLoopbackEndToEnd(t *testing.T) {
-	limits := store.DefaultLimits()
+	limits := relayroom.DefaultLimits()
 	fixture := newStoreFixture(t, limits)
 	room := fixture.addRoom(t, "room", 2)
 	otherRoom := fixture.addRoom(t, "other-room", 1)
@@ -1063,7 +1063,7 @@ func TestRealLoopbackEndToEnd(t *testing.T) {
 	newA.sendData(t, relayEndpoint, 2, []byte("after-delete"))
 	b.expectSilence(t)
 
-	fixture.fakeClock.set(store.HardMaxBindingTTL)
+	fixture.fakeClock.set(relayroom.HardMaxBindingTTL)
 	d.sendData(t, relayEndpoint, 1, []byte("at-expiry"))
 	e.expectSilence(t)
 
@@ -1096,7 +1096,7 @@ func newLoopClient(t testing.TB) *loopClient {
 	return &loopClient{conn: conn}
 }
 
-func (client *loopClient) bind(t testing.TB, relayEndpoint netip.AddrPort, roomID string, grant store.GrantAllocation, nonceByte byte) {
+func (client *loopClient) bind(t testing.TB, relayEndpoint netip.AddrPort, roomID string, grant relayroom.ParticipantGrant, nonceByte byte) {
 	t.Helper()
 	nonce := filled16(nonceByte)
 	client.send(t, relayEndpoint, helloDatagram(roomID, grant.SessionID, grant.GrantID, nonce))
@@ -1198,7 +1198,7 @@ func FuzzDispatch(f *testing.F) {
 		if len(input) > protocol.MaxDatagramBytes+1 {
 			input = input[:protocol.MaxDatagramBytes+1]
 		}
-		limits := store.DefaultLimits()
+		limits := relayroom.DefaultLimits()
 		limits.MaxOpenRooms, limits.MaxRoomRecords = 1, 1
 		limits.MaxRoomCapacity, limits.MaxActiveSessions = 1, 1
 		fixture := newStoreFixture(t, limits)
@@ -1208,7 +1208,7 @@ func FuzzDispatch(f *testing.F) {
 		if err != nil {
 			t.Fatalf("New(): %v", err)
 		}
-		if err := relay.dispatch(input, netip.MustParseAddrPort("192.0.2.200:5000")); err != nil {
+		if err := relay.handleDatagram(input, netip.MustParseAddrPort("192.0.2.200:5000")); err != nil {
 			t.Fatalf("dispatch(): %v", err)
 		}
 		counters := relay.Counters()
@@ -1312,35 +1312,35 @@ func dropTotal(reasons DropReasons) uint64 {
 		reasons.WrongEndpoint + reasons.NotBound + reasons.RateLimited + reasons.FanoutLimited + reasons.Draining
 }
 
-func dropCount(reasons DropReasons, reason store.RejectReason) uint64 {
+func dropCount(reasons DropReasons, reason relayroom.RejectReason) uint64 {
 	switch reason {
-	case store.RejectMalformed:
+	case relayroom.RejectMalformed:
 		return reasons.Malformed
-	case store.RejectOversized:
+	case relayroom.RejectOversized:
 		return reasons.Oversized
-	case store.RejectUnsupportedVersion:
+	case relayroom.RejectUnsupportedVersion:
 		return reasons.UnsupportedVersion
-	case store.RejectUnknownGrant:
+	case relayroom.RejectUnknownGrant:
 		return reasons.UnknownGrant
-	case store.RejectAuthFailed:
+	case relayroom.RejectAuthFailed:
 		return reasons.AuthFailed
-	case store.RejectReplay:
+	case relayroom.RejectReplay:
 		return reasons.Replay
-	case store.RejectExpired:
+	case relayroom.RejectExpired:
 		return reasons.Expired
-	case store.RejectRevoked:
+	case relayroom.RejectRevoked:
 		return reasons.Revoked
-	case store.RejectWrongRoom:
+	case relayroom.RejectWrongRoom:
 		return reasons.WrongRoom
-	case store.RejectWrongEndpoint:
+	case relayroom.RejectWrongEndpoint:
 		return reasons.WrongEndpoint
-	case store.RejectNotBound:
+	case relayroom.RejectNotBound:
 		return reasons.NotBound
-	case store.RejectRateLimited:
+	case relayroom.RejectRateLimited:
 		return reasons.RateLimited
-	case store.RejectFanoutLimited:
+	case relayroom.RejectFanoutLimited:
 		return reasons.FanoutLimited
-	case store.RejectDraining:
+	case relayroom.RejectDraining:
 		return reasons.Draining
 	default:
 		return 0

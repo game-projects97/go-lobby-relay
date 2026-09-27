@@ -38,7 +38,7 @@ go-test: tools
 
 relay-build: tools
 	mkdir -p $(CURDIR)/out
-	$(GO_ENV) $(GO) build -o $(CURDIR)/out/relay ./cmd/relay
+	$(GO_ENV) $(GO) build -o $(CURDIR)/out/lobby-relay ./cmd/lobby-relay
 
 csharp-compat:
 	dotnet restore --artifacts-path $(CURDIR)/out/dotnet --locked-mode test/compat/csharp/Relay.Protocol.Compat.csproj

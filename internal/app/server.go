@@ -1,4 +1,4 @@
-package server
+package app
 
 import (
 	"context"
@@ -9,30 +9,30 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gyungsubLee/go-lobby-relay/internal/control"
-	"github.com/gyungsubLee/go-lobby-relay/internal/lobby"
-	"github.com/gyungsubLee/go-lobby-relay/internal/playerapi"
+	"github.com/gyungsubLee/go-lobby-relay/internal/httpapi/operatorapi"
+	"github.com/gyungsubLee/go-lobby-relay/internal/httpapi/playerapi"
+	"github.com/gyungsubLee/go-lobby-relay/internal/matchmaking"
 	"github.com/gyungsubLee/go-lobby-relay/internal/playerauth"
-	"github.com/gyungsubLee/go-lobby-relay/internal/relay"
-	"github.com/gyungsubLee/go-lobby-relay/internal/store"
+	"github.com/gyungsubLee/go-lobby-relay/internal/relayroom"
+	"github.com/gyungsubLee/go-lobby-relay/internal/udprelay"
 )
 
 var (
-	errInvalidConfig  = errors.New("server: invalid configuration")
-	errBind           = errors.New("server: listener bind failed")
-	errOwnedLoop      = errors.New("server: owned loop failed")
-	errAlreadyRunning = errors.New("server: already running")
-	errClose          = errors.New("server: close failed")
+	errInvalidConfig  = errors.New("app: invalid configuration")
+	errBind           = errors.New("app: listener bind failed")
+	errOwnedLoop      = errors.New("app: owned loop failed")
+	errAlreadyRunning = errors.New("app: already running")
+	errClose          = errors.New("app: close failed")
 )
 
 type Config struct {
-	ManagementListen string
-	PlayerListen     string
-	RelayNetwork     string
-	RelayListen      string
-	AdvertisedHost   string
-	AdvertisedPort   uint16
-	OperatorToken    [32]byte
+	OperatorListen string
+	PlayerListen   string
+	RelayNetwork   string
+	RelayListen    string
+	AdvertisedHost string
+	AdvertisedPort uint16
+	OperatorToken  [32]byte
 }
 
 type dependencies struct {
@@ -47,16 +47,16 @@ func defaultDependencies() dependencies {
 }
 
 type Server struct {
-	managementListener net.Listener
-	managementServer   *http.Server
-	playerListener     net.Listener
-	playerServer       *http.Server
-	relay              *relay.Relay
-	rooms              *store.Store
-	lobbies            *lobby.Manager
-	managementAddr     net.Addr
-	playerAddr         net.Addr
-	relayAddr          net.Addr
+	operatorListener net.Listener
+	operatorServer   *http.Server
+	playerListener   net.Listener
+	playerServer     *http.Server
+	udpRelay         *udprelay.Server
+	rooms            *relayroom.Store
+	lobbies          *matchmaking.Manager
+	operatorAddr     net.Addr
+	playerAddr       net.Addr
+	relayAddr        net.Addr
 
 	mu              sync.Mutex
 	runStarted      bool
@@ -79,7 +79,7 @@ func newWithDependencies(config Config, deps dependencies) (*Server, error) {
 	if err != nil || deps.listenTCP == nil || deps.listenUDP == nil {
 		return nil, errInvalidConfig
 	}
-	rooms, err := store.New(store.Config{Limits: store.DefaultLimits(), Random: deps.random})
+	rooms, err := relayroom.New(relayroom.Config{Limits: relayroom.DefaultLimits(), Random: deps.random})
 	if err != nil {
 		return nil, errInvalidConfig
 	}
@@ -87,29 +87,29 @@ func newWithDependencies(config Config, deps dependencies) (*Server, error) {
 	if err != nil {
 		return nil, errInvalidConfig
 	}
-	lobbies, err := lobby.New(lobby.Config{Rooms: rooms, Random: deps.random})
+	lobbies, err := matchmaking.New(matchmaking.Config{Rooms: rooms, Random: deps.random})
 	if err != nil {
 		return nil, errInvalidConfig
 	}
-	managementListener, err := deps.listenTCP("tcp", config.ManagementListen)
+	operatorListener, err := deps.listenTCP("tcp", config.OperatorListen)
 	if err != nil {
 		return nil, errBind
 	}
 	playerListener, err := deps.listenTCP("tcp", config.PlayerListen)
 	if err != nil {
-		_ = managementListener.Close()
+		_ = operatorListener.Close()
 		return nil, errBind
 	}
 	relaySocket, err := deps.listenUDP(config.RelayNetwork, relayAddress)
 	if err != nil {
 		_ = playerListener.Close()
-		_ = managementListener.Close()
+		_ = operatorListener.Close()
 		return nil, errBind
 	}
 	cleanup := true
 	defer func() {
 		if cleanup {
-			_ = managementListener.Close()
+			_ = operatorListener.Close()
 			_ = playerListener.Close()
 			_ = relaySocket.Close()
 		}
@@ -120,24 +120,24 @@ func newWithDependencies(config Config, deps dependencies) (*Server, error) {
 		advertisedPort = uint16(relaySocket.LocalAddr().(*net.UDPAddr).Port)
 	}
 	server := &Server{
-		managementListener: managementListener,
-		playerListener:     playerListener,
-		rooms:              rooms,
-		lobbies:            lobbies,
-		managementAddr:     managementListener.Addr(),
-		playerAddr:         playerListener.Addr(),
-		relayAddr:          relaySocket.LocalAddr(),
-		closeSignal:        make(chan struct{}),
-		fatalSignal:        make(chan struct{}),
+		operatorListener: operatorListener,
+		playerListener:   playerListener,
+		rooms:            rooms,
+		lobbies:          lobbies,
+		operatorAddr:     operatorListener.Addr(),
+		playerAddr:       playerListener.Addr(),
+		relayAddr:        relaySocket.LocalAddr(),
+		closeSignal:      make(chan struct{}),
+		fatalSignal:      make(chan struct{}),
 	}
-	handler, err := control.NewHandler(control.Config{
+	handler, err := operatorapi.NewHandler(operatorapi.Config{
 		OperatorToken:  config.OperatorToken,
 		PlayerTokens:   playerTokens,
 		AdvertisedHost: config.AdvertisedHost,
 		AdvertisedPort: advertisedPort,
-		RequestRate:    control.HardManagementRequestRate,
-		RequestBurst:   control.HardManagementRequestBurst,
-		MaxConcurrent:  control.HardManagementConcurrent,
+		RequestRate:    operatorapi.HardOperatorRequestRate,
+		RequestBurst:   operatorapi.HardOperatorRequestBurst,
+		MaxConcurrent:  operatorapi.HardOperatorConcurrent,
 		Fatal:          server.notifyFatal,
 	}, rooms)
 	if err != nil {
@@ -151,24 +151,24 @@ func newWithDependencies(config Config, deps dependencies) (*Server, error) {
 	if err != nil {
 		return nil, errInvalidConfig
 	}
-	udpRelay, err := relay.New(relaySocket, rooms, relay.Config{})
+	udpRelay, err := udprelay.New(relaySocket, rooms, udprelay.Config{})
 	if err != nil {
 		return nil, errInvalidConfig
 	}
 
-	server.managementServer = control.NewServer(managementListener.Addr().String(), handler)
+	server.operatorServer = operatorapi.NewServer(operatorListener.Addr().String(), handler)
 	server.playerServer = playerapi.NewServer(playerListener.Addr().String(), playerHandler)
-	server.relay = udpRelay
+	server.udpRelay = udpRelay
 	cleanup = false
 	return server, nil
 }
 
 func validateConfig(config Config) (*net.UDPAddr, error) {
-	if config.ManagementListen == "" || config.PlayerListen == "" || config.RelayListen == "" || config.AdvertisedHost == "" ||
+	if config.OperatorListen == "" || config.PlayerListen == "" || config.RelayListen == "" || config.AdvertisedHost == "" ||
 		config.OperatorToken == ([32]byte{}) || (config.RelayNetwork != "udp4" && config.RelayNetwork != "udp6") {
 		return nil, errInvalidConfig
 	}
-	if _, err := net.ResolveTCPAddr("tcp", config.ManagementListen); err != nil {
+	if _, err := net.ResolveTCPAddr("tcp", config.OperatorListen); err != nil {
 		return nil, errInvalidConfig
 	}
 	if _, err := net.ResolveTCPAddr("tcp", config.PlayerListen); err != nil {
@@ -181,7 +181,7 @@ func validateConfig(config Config) (*net.UDPAddr, error) {
 	return relayAddress, nil
 }
 
-func (server *Server) ManagementAddr() net.Addr { return server.managementAddr }
+func (server *Server) OperatorAddr() net.Addr { return server.operatorAddr }
 
 func (server *Server) PlayerAddr() net.Addr { return server.playerAddr }
 
@@ -212,15 +212,15 @@ func (server *Server) Run(ctx context.Context) error {
 	runContext, cancel := context.WithCancel(ctx)
 	results := make(chan loopResult, 4)
 	go func() {
-		err := server.managementServer.Serve(server.managementListener)
-		results <- server.classifyLoopResult(runContext, "management", err)
+		err := server.operatorServer.Serve(server.operatorListener)
+		results <- server.classifyLoopResult(runContext, "operator", err)
 	}()
 	go func() {
 		err := server.playerServer.Serve(server.playerListener)
 		results <- server.classifyLoopResult(runContext, "player", err)
 	}()
 	go func() {
-		err := server.relay.Run()
+		err := server.udpRelay.Run()
 		results <- server.classifyLoopResult(runContext, "relay", err)
 	}()
 	go func() {
@@ -315,12 +315,12 @@ func (server *Server) Close() error {
 
 func (server *Server) shutdown() error {
 	server.shutdownOnce.Do(func() {
-		managementErr := server.managementServer.Close()
+		operatorErr := server.operatorServer.Close()
 		playerErr := server.playerServer.Close()
-		listenerErr := server.managementListener.Close()
+		listenerErr := server.operatorListener.Close()
 		playerListenerErr := server.playerListener.Close()
-		relayErr := server.relay.Close()
-		if managementErr != nil && !errors.Is(managementErr, http.ErrServerClosed) && !errors.Is(managementErr, net.ErrClosed) ||
+		relayErr := server.udpRelay.Close()
+		if operatorErr != nil && !errors.Is(operatorErr, http.ErrServerClosed) && !errors.Is(operatorErr, net.ErrClosed) ||
 			playerErr != nil && !errors.Is(playerErr, http.ErrServerClosed) && !errors.Is(playerErr, net.ErrClosed) ||
 			listenerErr != nil && !errors.Is(listenerErr, net.ErrClosed) ||
 			playerListenerErr != nil && !errors.Is(playerListenerErr, net.ErrClosed) || relayErr != nil {

@@ -1,4 +1,4 @@
-package relay
+package udprelay
 
 import (
 	"errors"
@@ -10,7 +10,7 @@ import (
 
 	relayv1 "github.com/gyungsubLee/go-lobby-relay/gen/go/relay/v1"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
-	"github.com/gyungsubLee/go-lobby-relay/internal/store"
+	"github.com/gyungsubLee/go-lobby-relay/internal/relayroom"
 )
 
 const (
@@ -19,11 +19,11 @@ const (
 )
 
 var (
-	errInvalidConfig = errors.New("relay: invalid configuration")
-	errRead          = errors.New("relay: socket read failed")
-	errClose         = errors.New("relay: socket close failed")
-	errAlreadyRun    = errors.New("relay: already running")
-	errInternal      = errors.New("relay: internal failure")
+	errInvalidConfig = errors.New("udprelay: invalid configuration")
+	errRead          = errors.New("udprelay: socket read failed")
+	errClose         = errors.New("udprelay: socket close failed")
+	errAlreadyRun    = errors.New("udprelay: already running")
+	errInternal      = errors.New("udprelay: internal failure")
 )
 
 type udpSocket interface {
@@ -65,9 +65,9 @@ type Counters struct {
 	DropReasons          DropReasons
 }
 
-type Relay struct {
+type Server struct {
 	socket       udpSocket
-	rooms        *store.Store
+	rooms        *relayroom.Store
 	writeTimeout time.Duration
 	now          func() time.Time
 
@@ -81,7 +81,7 @@ type Relay struct {
 	counters   Counters
 }
 
-func New(socket udpSocket, rooms *store.Store, config Config) (*Relay, error) {
+func New(socket udpSocket, rooms *relayroom.Store, config Config) (*Server, error) {
 	if nilSocket(socket) || rooms == nil || config.WriteTimeout < 0 || config.WriteTimeout > maxWriteTimeout {
 		return nil, errInvalidConfig
 	}
@@ -91,7 +91,7 @@ func New(socket udpSocket, rooms *store.Store, config Config) (*Relay, error) {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	return &Relay{socket: socket, rooms: rooms, writeTimeout: config.WriteTimeout, now: config.Now}, nil
+	return &Server{socket: socket, rooms: rooms, writeTimeout: config.WriteTimeout, now: config.Now}, nil
 }
 
 func nilSocket(socket udpSocket) bool {
@@ -102,7 +102,7 @@ func nilSocket(socket udpSocket) bool {
 	return value.Kind() == reflect.Pointer && value.IsNil()
 }
 
-func (relay *Relay) Run() error {
+func (relay *Server) Run() error {
 	relay.runMu.Lock()
 	if relay.run {
 		relay.runMu.Unlock()
@@ -131,7 +131,7 @@ func (relay *Relay) Run() error {
 			return errRead
 		}
 		endpoint = normalizeEndpoint(endpoint)
-		if err := relay.dispatch(buffer[:read], endpoint); err != nil {
+		if err := relay.handleDatagram(buffer[:read], endpoint); err != nil {
 			return err
 		}
 	}
@@ -144,7 +144,7 @@ func normalizeEndpoint(endpoint netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(endpoint.Addr().Unmap(), endpoint.Port())
 }
 
-func (relay *Relay) Close() error {
+func (relay *Server) Close() error {
 	relay.closeOnce.Do(func() {
 		relay.closed.Store(true)
 		if relay.socket.Close() != nil {
@@ -154,13 +154,13 @@ func (relay *Relay) Close() error {
 	return relay.closeErr
 }
 
-func (relay *Relay) Counters() Counters {
+func (relay *Server) Counters() Counters {
 	relay.countersMu.Lock()
 	defer relay.countersMu.Unlock()
 	return relay.counters
 }
 
-func (relay *Relay) dispatch(datagram []byte, endpoint netip.AddrPort) error {
+func (relay *Server) handleDatagram(datagram []byte, endpoint netip.AddrPort) error {
 	endpoint = normalizeEndpoint(endpoint)
 	relay.countersMu.Lock()
 	relay.counters.UDPReceived++
@@ -169,8 +169,8 @@ func (relay *Relay) dispatch(datagram []byte, endpoint netip.AddrPort) error {
 	envelope, err := protocol.DecodeClient(datagram)
 	if err != nil {
 		reason := protocolRejectReason(err)
-		if relay.rooms.AdmitPreauth(store.PreauthRequest{Endpoint: endpoint, InputBytes: len(datagram)}) != store.RejectNone {
-			reason = store.RejectRateLimited
+		if relay.rooms.AdmitPreauth(relayroom.PreauthRequest{Endpoint: endpoint, InputBytes: len(datagram)}) != relayroom.RejectNone {
+			reason = relayroom.RejectRateLimited
 		}
 		relay.recordDrop(reason)
 		return nil
@@ -178,12 +178,12 @@ func (relay *Relay) dispatch(datagram []byte, endpoint netip.AddrPort) error {
 
 	switch body := envelope.Body.(type) {
 	case *relayv1.Envelope_Hello:
-		result, reason := relay.rooms.BeginChallenge(store.ChallengeRequest{
+		result, reason := relay.rooms.AdmitHello(relayroom.HelloRequest{
 			RoomID: envelope.RoomId, SessionID: envelope.SessionId,
 			GrantID: copy16(body.Hello.GrantId), ClientNonce: copy16(body.Hello.ClientNonce),
 			Endpoint: endpoint, InputBytes: len(datagram),
 		})
-		if reason != store.RejectNone {
+		if reason != relayroom.RejectNone {
 			return relay.reject(reason)
 		}
 		response, err := protocol.EncodeServer(&relayv1.Envelope{
@@ -199,12 +199,12 @@ func (relay *Relay) dispatch(datagram []byte, endpoint netip.AddrPort) error {
 		return nil
 
 	case *relayv1.Envelope_Auth:
-		result, reason := relay.rooms.Authenticate(store.AuthenticateRequest{
+		result, reason := relay.rooms.AdmitAuth(relayroom.AuthRequest{
 			RoomID: envelope.RoomId, SessionID: envelope.SessionId,
 			CandidateID: copy16(body.Auth.CandidateId), Endpoint: endpoint,
 			AuthTag: copy32(envelope.AuthTag), InputBytes: len(datagram),
 		})
-		if reason != store.RejectNone {
+		if reason != relayroom.RejectNone {
 			return relay.reject(reason)
 		}
 		response, err := protocol.EncodeServer(&relayv1.Envelope{
@@ -220,12 +220,12 @@ func (relay *Relay) dispatch(datagram []byte, endpoint netip.AddrPort) error {
 		return nil
 
 	case *relayv1.Envelope_ClientData:
-		admitted, reason := relay.rooms.AdmitClientIngress(store.ClientDataRequest{
+		admitted, reason := relay.rooms.AdmitClientData(relayroom.ClientDataRequest{
 			RoomID: envelope.RoomId, SessionID: envelope.SessionId,
 			BindingID: copy16(body.ClientData.BindingId), Sequence: envelope.Sequence,
 			Payload: body.ClientData.Payload, Endpoint: endpoint, AuthTag: copy32(envelope.AuthTag),
 		}, len(datagram))
-		if reason != store.RejectNone {
+		if reason != relayroom.RejectNone {
 			return relay.reject(reason)
 		}
 		response, err := protocol.EncodeServer(&relayv1.Envelope{
@@ -239,8 +239,8 @@ func (relay *Relay) dispatch(datagram []byte, endpoint netip.AddrPort) error {
 			relay.recordDrop(protocolRejectReason(err))
 			return nil
 		}
-		plan, reason := relay.rooms.AdmitFanout(admitted, len(response))
-		if reason != store.RejectNone {
+		plan, reason := relay.rooms.PlanFanout(admitted, len(response))
+		if reason != relayroom.RejectNone {
 			return relay.reject(reason)
 		}
 		relay.countersMu.Lock()
@@ -250,12 +250,12 @@ func (relay *Relay) dispatch(datagram []byte, endpoint netip.AddrPort) error {
 		return nil
 
 	case *relayv1.Envelope_Ping:
-		reason := relay.rooms.AdmitPing(store.PingRequest{
+		reason := relay.rooms.AdmitPing(relayroom.PingRequest{
 			RoomID: envelope.RoomId, SessionID: envelope.SessionId,
 			BindingID: copy16(body.Ping.BindingId), Sequence: envelope.Sequence,
 			Endpoint: endpoint, AuthTag: copy32(envelope.AuthTag),
 		}, len(datagram))
-		if reason != store.RejectNone {
+		if reason != relayroom.RejectNone {
 			return relay.reject(reason)
 		}
 		return nil
@@ -274,33 +274,33 @@ func copy32(input []byte) (output protocol.Bytes32) {
 	return output
 }
 
-func protocolRejectReason(err error) store.RejectReason {
+func protocolRejectReason(err error) relayroom.RejectReason {
 	switch protocol.ReasonOf(err) {
 	case protocol.ReasonOversized:
-		return store.RejectOversized
+		return relayroom.RejectOversized
 	case protocol.ReasonUnsupportedVersion:
-		return store.RejectUnsupportedVersion
+		return relayroom.RejectUnsupportedVersion
 	default:
-		return store.RejectMalformed
+		return relayroom.RejectMalformed
 	}
 }
 
-func (relay *Relay) reject(reason store.RejectReason) error {
-	if reason == store.RejectFatalRandom {
+func (relay *Server) reject(reason relayroom.RejectReason) error {
+	if reason == relayroom.RejectFatalRandom {
 		return errInternal
 	}
 	relay.recordDrop(reason)
 	return nil
 }
 
-func (relay *Relay) writeOne(datagram []byte, endpoint netip.AddrPort) {
+func (relay *Server) writeOne(datagram []byte, endpoint netip.AddrPort) {
 	if relay.socket.SetWriteDeadline(relay.now().Add(relay.writeTimeout)) != nil {
 		return
 	}
 	_, _ = relay.socket.WriteToUDPAddrPort(datagram, endpoint)
 }
 
-func (relay *Relay) writeFanout(datagram []byte, recipients []netip.AddrPort) {
+func (relay *Server) writeFanout(datagram []byte, recipients []netip.AddrPort) {
 	if len(recipients) == 0 || relay.socket.SetWriteDeadline(relay.now().Add(relay.writeTimeout)) != nil {
 		return
 	}
@@ -320,38 +320,38 @@ func (relay *Relay) writeFanout(datagram []byte, recipients []netip.AddrPort) {
 	}
 }
 
-func (relay *Relay) recordDrop(reason store.RejectReason) {
+func (relay *Server) recordDrop(reason relayroom.RejectReason) {
 	relay.countersMu.Lock()
 	defer relay.countersMu.Unlock()
 	recorded := true
 	switch reason {
-	case store.RejectMalformed:
+	case relayroom.RejectMalformed:
 		relay.counters.DropReasons.Malformed++
-	case store.RejectOversized:
+	case relayroom.RejectOversized:
 		relay.counters.DropReasons.Oversized++
-	case store.RejectUnsupportedVersion:
+	case relayroom.RejectUnsupportedVersion:
 		relay.counters.DropReasons.UnsupportedVersion++
-	case store.RejectUnknownGrant:
+	case relayroom.RejectUnknownGrant:
 		relay.counters.DropReasons.UnknownGrant++
-	case store.RejectAuthFailed:
+	case relayroom.RejectAuthFailed:
 		relay.counters.DropReasons.AuthFailed++
-	case store.RejectReplay:
+	case relayroom.RejectReplay:
 		relay.counters.DropReasons.Replay++
-	case store.RejectExpired:
+	case relayroom.RejectExpired:
 		relay.counters.DropReasons.Expired++
-	case store.RejectRevoked:
+	case relayroom.RejectRevoked:
 		relay.counters.DropReasons.Revoked++
-	case store.RejectWrongRoom:
+	case relayroom.RejectWrongRoom:
 		relay.counters.DropReasons.WrongRoom++
-	case store.RejectWrongEndpoint:
+	case relayroom.RejectWrongEndpoint:
 		relay.counters.DropReasons.WrongEndpoint++
-	case store.RejectNotBound:
+	case relayroom.RejectNotBound:
 		relay.counters.DropReasons.NotBound++
-	case store.RejectRateLimited:
+	case relayroom.RejectRateLimited:
 		relay.counters.DropReasons.RateLimited++
-	case store.RejectFanoutLimited:
+	case relayroom.RejectFanoutLimited:
 		relay.counters.DropReasons.FanoutLimited++
-	case store.RejectDraining:
+	case relayroom.RejectDraining:
 		relay.counters.DropReasons.Draining++
 	default:
 		recorded = false

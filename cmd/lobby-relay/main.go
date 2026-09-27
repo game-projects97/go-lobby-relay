@@ -13,8 +13,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/gyungsubLee/go-lobby-relay/internal/control"
-	"github.com/gyungsubLee/go-lobby-relay/internal/server"
+	"github.com/gyungsubLee/go-lobby-relay/internal/app"
+	"github.com/gyungsubLee/go-lobby-relay/internal/httpapi/operatorapi"
 )
 
 var errStartup = errors.New("relay: startup failed")
@@ -35,17 +35,17 @@ func (value *requiredValue) Set(next string) error {
 	return nil
 }
 
-func parseConfig(args []string) (server.Config, error) {
+func parseConfig(args []string) (app.Config, error) {
 	for _, argument := range args {
 		if argument == "--" || strings.HasPrefix(argument, "-") && !strings.HasPrefix(argument, "--") {
-			return server.Config{}, errStartup
+			return app.Config{}, errStartup
 		}
 	}
 
 	flags := flag.NewFlagSet("relay", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	var managementListen, playerListen, relayNetwork, relayListen, advertisedHost, advertisedPort, operatorTokenFile requiredValue
-	flags.Var(&managementListen, "management-listen", "")
+	var operatorListen, playerListen, relayNetwork, relayListen, advertisedHost, advertisedPort, operatorTokenFile requiredValue
+	flags.Var(&operatorListen, "management-listen", "")
 	flags.Var(&playerListen, "player-listen", "")
 	flags.Var(&relayNetwork, "relay-network", "")
 	flags.Var(&relayListen, "relay-listen", "")
@@ -53,36 +53,36 @@ func parseConfig(args []string) (server.Config, error) {
 	flags.Var(&advertisedPort, "advertised-port", "")
 	flags.Var(&operatorTokenFile, "operator-token-file", "")
 	values := []*requiredValue{
-		&managementListen, &playerListen, &relayNetwork, &relayListen,
+		&operatorListen, &playerListen, &relayNetwork, &relayListen,
 		&advertisedHost, &advertisedPort, &operatorTokenFile,
 	}
 	if flags.Parse(args) != nil || flags.NArg() != 0 {
-		return server.Config{}, errStartup
+		return app.Config{}, errStartup
 	}
 	for _, value := range values {
 		if !value.set || value.value == "" {
-			return server.Config{}, errStartup
+			return app.Config{}, errStartup
 		}
 	}
 	if relayNetwork.value != "udp4" && relayNetwork.value != "udp6" || !filepath.IsAbs(operatorTokenFile.value) {
-		return server.Config{}, errStartup
+		return app.Config{}, errStartup
 	}
 	port, err := strconv.ParseUint(advertisedPort.value, 10, 16)
 	if err != nil || port == 0 {
-		return server.Config{}, errStartup
+		return app.Config{}, errStartup
 	}
 	token, err := readOperatorToken(operatorTokenFile.value)
 	if err != nil {
-		return server.Config{}, errStartup
+		return app.Config{}, errStartup
 	}
-	return server.Config{
-		ManagementListen: managementListen.value,
-		PlayerListen:     playerListen.value,
-		RelayNetwork:     relayNetwork.value,
-		RelayListen:      relayListen.value,
-		AdvertisedHost:   advertisedHost.value,
-		AdvertisedPort:   uint16(port),
-		OperatorToken:    token,
+	return app.Config{
+		OperatorListen: operatorListen.value,
+		PlayerListen:   playerListen.value,
+		RelayNetwork:   relayNetwork.value,
+		RelayListen:    relayListen.value,
+		AdvertisedHost: advertisedHost.value,
+		AdvertisedPort: uint16(port),
+		OperatorToken:  token,
 	}, nil
 }
 
@@ -120,7 +120,7 @@ func readOperatorTokenWith(path string, open func(string) (*os.File, error)) ([3
 	default:
 		return [32]byte{}, errStartup
 	}
-	token, err := control.ParseOperatorToken(string(body[:43]))
+	token, err := operatorapi.ParseOperatorToken(string(body[:43]))
 	if err != nil {
 		return [32]byte{}, errStartup
 	}
@@ -132,12 +132,12 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return errStartup
 	}
-	relayServer, err := server.New(config)
+	application, err := app.New(config)
 	if err != nil {
 		return errStartup
 	}
-	defer relayServer.Close()
-	if err := relayServer.Run(ctx); err != nil {
+	defer application.Close()
+	if err := application.Run(ctx); err != nil {
 		return errStartup
 	}
 	return nil

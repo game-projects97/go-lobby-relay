@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/gyungsubLee/go-lobby-relay/internal/clock"
-	"github.com/gyungsubLee/go-lobby-relay/internal/lobby"
+	"github.com/gyungsubLee/go-lobby-relay/internal/matchmaking"
 	"github.com/gyungsubLee/go-lobby-relay/internal/playerauth"
-	"github.com/gyungsubLee/go-lobby-relay/internal/store"
+	"github.com/gyungsubLee/go-lobby-relay/internal/relayroom"
 )
 
 var apiWall = time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
@@ -26,7 +26,7 @@ func TestPlayerLobbyLifecycle(t *testing.T) {
 
 	created := fixture.request(t, owner, http.MethodPost, "/v1/lobbies", `{"visibility":"private","queue_key":"duo","capacity":2}`)
 	assertStatus(t, created, http.StatusCreated)
-	var lobbyBody lobbyResponse
+	var lobbyBody decodedLobby
 	decode(t, created, &lobbyBody)
 	if lobbyBody.OwnerPlayerID != "owner" || len(lobbyBody.Members) != 1 || lobbyBody.Assignment != nil {
 		t.Fatalf("created lobby = %+v raw=%s", lobbyBody, created.Body.String())
@@ -55,7 +55,7 @@ func TestPlayerLobbyLifecycle(t *testing.T) {
 	assertStatus(t, nonOwner, http.StatusForbidden)
 	started := fixture.request(t, owner, http.MethodPost, "/v1/lobbies/"+lobbyBody.LobbyID+"/start", fmt.Sprintf(`{"revision":%d}`, lobbyBody.Revision))
 	assertStatus(t, started, http.StatusOK)
-	var ownerAssignment assignmentResponse
+	var ownerAssignment decodedAssignment
 	decode(t, started, &ownerAssignment)
 	if ownerAssignment.PlayerID != "owner" || ownerAssignment.RelayEndpoint.Port != 30000 || ownerAssignment.GrantSecret == "" {
 		t.Fatalf("owner assignment = %+v", ownerAssignment)
@@ -75,7 +75,7 @@ func TestQuickMatchReturnsPrivateAssignments(t *testing.T) {
 
 	first := fixture.request(t, a, http.MethodPost, "/v1/matchmaking/tickets", `{"queue_key":"duo","capacity":2}`)
 	assertStatus(t, first, http.StatusCreated)
-	var firstTicket ticketResponse
+	var firstTicket decodedTicket
 	decode(t, first, &firstTicket)
 	if firstTicket.State != "queued" || firstTicket.Assignment != nil {
 		t.Fatalf("first ticket = %+v", firstTicket)
@@ -86,7 +86,7 @@ func TestQuickMatchReturnsPrivateAssignments(t *testing.T) {
 	for player, token := range map[string]string{"player-a": a, "player-b": b} {
 		got := fixture.request(t, token, http.MethodGet, "/v1/matchmaking/tickets/me", "")
 		assertStatus(t, got, http.StatusOK)
-		var ticket ticketResponse
+		var ticket decodedTicket
 		decode(t, got, &ticket)
 		if ticket.State != "matched" || ticket.Assignment == nil || ticket.Assignment.PlayerID != player || ticket.Assignment.GrantSecret == "" {
 			t.Fatalf("%s ticket = %+v", player, ticket)
@@ -103,7 +103,7 @@ func TestRemainingPlayerRoutes(t *testing.T) {
 
 	created := fixture.request(t, owner, http.MethodPost, "/v1/lobbies", `{"visibility":"public","queue_key":"duo","capacity":2}`)
 	assertStatus(t, created, http.StatusCreated)
-	var body lobbyResponse
+	var body decodedLobby
 	decode(t, created, &body)
 	listed := fixture.request(t, member, http.MethodGet, "/v1/lobbies?queue_key=duo", "")
 	assertStatus(t, listed, http.StatusOK)
@@ -120,7 +120,7 @@ func TestRemainingPlayerRoutes(t *testing.T) {
 
 	ticket := fixture.request(t, member, http.MethodPost, "/v1/matchmaking/tickets", `{"queue_key":"duo","capacity":2}`)
 	assertStatus(t, ticket, http.StatusCreated)
-	var ticketBody ticketResponse
+	var ticketBody decodedTicket
 	decode(t, ticket, &ticketBody)
 	cancelled := fixture.request(t, member, http.MethodDelete, "/v1/matchmaking/tickets/me", fmt.Sprintf(`{"revision":%d}`, ticketBody.Revision))
 	assertStatus(t, cancelled, http.StatusOK)
@@ -173,7 +173,7 @@ func TestPlayerAPIRejectsInvalidAuthAndInput(t *testing.T) {
 
 type fixture struct {
 	handler http.Handler
-	auth    *playerauth.Auth
+	auth    *playerauth.Issuer
 	now     *time.Time
 }
 
@@ -181,11 +181,11 @@ func newFixture(t *testing.T) fixture {
 	t.Helper()
 	now := apiWall
 	fakeClock := func() clock.Reading { return clock.Reading{Wall: now, Mono: time.Hour + now.Sub(apiWall)} }
-	relayStore, err := store.New(store.Config{Limits: store.DefaultLimits(), Now: fakeClock, Random: &sequenceReader{}})
+	relayStore, err := relayroom.New(relayroom.Config{Limits: relayroom.DefaultLimits(), Now: fakeClock, Random: &sequenceReader{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager, err := lobby.New(lobby.Config{Rooms: relayStore, Now: fakeClock, Random: &sequenceReader{next: 1}})
+	manager, err := matchmaking.New(matchmaking.Config{Rooms: relayStore, Now: fakeClock, Random: &sequenceReader{next: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,43 +237,43 @@ func (reader *sequenceReader) Read(buffer []byte) (int, error) {
 	return len(buffer), nil
 }
 
-type endpointResponse struct {
+type decodedEndpoint struct {
 	Host string `json:"host"`
 	Port uint16 `json:"port"`
 }
-type assignmentResponse struct {
-	MatchID        string           `json:"match_id"`
-	RoomID         string           `json:"room_id"`
-	PlayerID       string           `json:"player_id"`
-	SessionID      string           `json:"session_id"`
-	GrantID        string           `json:"grant_id"`
-	GrantSecret    string           `json:"grant_secret"`
-	GrantExpiresAt string           `json:"grant_expires_at"`
-	RelayEndpoint  endpointResponse `json:"relay_endpoint"`
+type decodedAssignment struct {
+	MatchID        string          `json:"match_id"`
+	RoomID         string          `json:"room_id"`
+	PlayerID       string          `json:"player_id"`
+	SessionID      string          `json:"session_id"`
+	GrantID        string          `json:"grant_id"`
+	GrantSecret    string          `json:"grant_secret"`
+	GrantExpiresAt string          `json:"grant_expires_at"`
+	RelayEndpoint  decodedEndpoint `json:"relay_endpoint"`
 }
-type memberResponse struct {
+type decodedMember struct {
 	PlayerID string `json:"player_id"`
 	Ready    bool   `json:"ready"`
 }
-type lobbyResponse struct {
-	LobbyID       string              `json:"lobby_id"`
-	OwnerPlayerID string              `json:"owner_player_id"`
-	QueueKey      string              `json:"queue_key"`
-	Visibility    string              `json:"visibility"`
-	Capacity      uint32              `json:"capacity"`
-	Revision      uint64              `json:"revision"`
-	State         string              `json:"state"`
-	Members       []memberResponse    `json:"members"`
-	Assignment    *assignmentResponse `json:"assignment,omitempty"`
+type decodedLobby struct {
+	LobbyID       string             `json:"lobby_id"`
+	OwnerPlayerID string             `json:"owner_player_id"`
+	QueueKey      string             `json:"queue_key"`
+	Visibility    string             `json:"visibility"`
+	Capacity      uint32             `json:"capacity"`
+	Revision      uint64             `json:"revision"`
+	State         string             `json:"state"`
+	Members       []decodedMember    `json:"members"`
+	Assignment    *decodedAssignment `json:"assignment,omitempty"`
 }
-type ticketResponse struct {
-	TicketID   string              `json:"ticket_id"`
-	PlayerID   string              `json:"player_id"`
-	QueueKey   string              `json:"queue_key"`
-	State      string              `json:"state"`
-	Capacity   uint32              `json:"capacity"`
-	Revision   uint64              `json:"revision"`
-	Assignment *assignmentResponse `json:"assignment,omitempty"`
+type decodedTicket struct {
+	TicketID   string             `json:"ticket_id"`
+	PlayerID   string             `json:"player_id"`
+	QueueKey   string             `json:"queue_key"`
+	State      string             `json:"state"`
+	Capacity   uint32             `json:"capacity"`
+	Revision   uint64             `json:"revision"`
+	Assignment *decodedAssignment `json:"assignment,omitempty"`
 }
 
 func assertStatus(t *testing.T, response *httptest.ResponseRecorder, status int) {

@@ -1,4 +1,4 @@
-package lobby
+package matchmaking
 
 import (
 	"crypto/rand"
@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/gyungsubLee/go-lobby-relay/internal/clock"
-	"github.com/gyungsubLee/go-lobby-relay/internal/store"
+	"github.com/gyungsubLee/go-lobby-relay/internal/relayroom"
 )
 
 const (
 	HardMaxOpenLobbies = 256
-	HardMaxMembers     = 16
+	HardMaxMatchSize   = 16
 	HardMaxLobbyTTL    = 2 * time.Hour
 	HardMaxListPage    = 50
 	DefaultLobbyTTL    = 30 * time.Minute
@@ -24,17 +24,17 @@ const (
 )
 
 var (
-	ErrInvalid     = errors.New("lobby: invalid")
-	ErrNotFound    = errors.New("lobby: not found")
-	ErrConflict    = errors.New("lobby: conflict")
-	ErrForbidden   = errors.New("lobby: forbidden")
-	ErrCapacity    = errors.New("lobby: capacity")
-	ErrUnavailable = errors.New("lobby: unavailable")
-	ErrFatalRandom = errors.New("lobby: fatal random")
+	ErrInvalid     = errors.New("matchmaking: invalid")
+	ErrNotFound    = errors.New("matchmaking: not found")
+	ErrConflict    = errors.New("matchmaking: conflict")
+	ErrForbidden   = errors.New("matchmaking: forbidden")
+	ErrCapacity    = errors.New("matchmaking: capacity")
+	ErrUnavailable = errors.New("matchmaking: unavailable")
+	ErrFatalRandom = errors.New("matchmaking: fatal random")
 )
 
 type Config struct {
-	Rooms  *store.Store
+	Rooms  *relayroom.Store
 	Now    func() clock.Reading
 	Random io.Reader
 }
@@ -42,7 +42,7 @@ type Config struct {
 type Manager struct {
 	mu sync.Mutex
 
-	rooms  *store.Store
+	rooms  *relayroom.Store
 	now    func() clock.Reading
 	random io.Reader
 
@@ -50,7 +50,7 @@ type Manager struct {
 	lobbyByPlayer   map[string]string
 	matchIDs        map[string]struct{}
 	ticketsByPlayer map[string]*ticketRecord
-	queues          map[queueKey][]string
+	queues          map[queueBucket][]string
 	nextSequence    uint64
 }
 
@@ -74,7 +74,7 @@ func New(config Config) (*Manager, error) {
 		lobbyByPlayer:   make(map[string]string),
 		matchIDs:        make(map[string]struct{}),
 		ticketsByPlayer: make(map[string]*ticketRecord),
-		queues:          make(map[queueKey][]string),
+		queues:          make(map[queueBucket][]string),
 		nextSequence:    1,
 	}, nil
 }

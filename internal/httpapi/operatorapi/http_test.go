@@ -1,4 +1,4 @@
-package control
+package operatorapi
 
 import (
 	"bufio"
@@ -21,7 +21,7 @@ import (
 	"github.com/gyungsubLee/go-lobby-relay/internal/clock"
 	"github.com/gyungsubLee/go-lobby-relay/internal/playerauth"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
-	"github.com/gyungsubLee/go-lobby-relay/internal/store"
+	"github.com/gyungsubLee/go-lobby-relay/internal/relayroom"
 	"golang.org/x/time/rate"
 )
 
@@ -72,7 +72,7 @@ func TestParseOperatorTokenIsStrictAndRejectsZero(t *testing.T) {
 }
 
 func TestOperatorCanIssuePlayerToken(t *testing.T) {
-	fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+	fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 	response := serveHandler(t, fixture.handler, http.MethodPost, "/v1/player-tokens", strings.NewReader(`{"player_id":"player-a"}`), controlBearer, "application/json")
 	if response.Code != http.StatusCreated {
 		t.Fatalf("POST /v1/player-tokens = %d %q", response.Code, response.Body.String())
@@ -126,7 +126,7 @@ func TestHandlerAuthenticatesAndRoutesCanonically(t *testing.T) {
 	}
 	for _, tt := range authTests {
 		t.Run(tt.name, func(t *testing.T) {
-			fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+			fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 			response := serveHandler(t, fixture.handler, http.MethodGet, "/v1/rooms/room", nil, tt.header, "")
 			assertErrorResponse(t, response, http.StatusUnauthorized, "unauthorized", unauthorizedMessage)
 			if got := response.Header().Get("WWW-Authenticate"); got != "Bearer" {
@@ -136,9 +136,9 @@ func TestHandlerAuthenticatesAndRoutesCanonically(t *testing.T) {
 	}
 
 	t.Run("wrong token does not disclose existence", func(t *testing.T) {
-		fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
-		definition := testStoreDefinition(controlTestWall, 1)
-		if _, _, err := fixture.store.CreateRoom("existing", definition); err != nil {
+		fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
+		roomSpec := testRoomSpec(controlTestWall, 1)
+		if _, _, err := fixture.store.CreateRoom("existing", roomSpec); err != nil {
 			t.Fatalf("CreateRoom(): %v", err)
 		}
 		wrong := "Bearer " + base64.RawURLEncoding.EncodeToString(wrongToken[:])
@@ -151,17 +151,17 @@ func TestHandlerAuthenticatesAndRoutesCanonically(t *testing.T) {
 	})
 
 	t.Run("unauthorized PUT cannot mutate", func(t *testing.T) {
-		fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+		fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 		body := createRoomBody(t, controlTestWall, 2*time.Hour, []testParticipantSpec{{"participant", "session", time.Hour}})
 		response := serveHandler(t, fixture.handler, http.MethodPut, "/v1/rooms/room", bytes.NewReader(body), "", "application/json")
 		assertErrorResponse(t, response, http.StatusUnauthorized, "unauthorized", unauthorizedMessage)
-		if _, err := fixture.store.GetRoom("room"); !errors.Is(err, store.ErrNotFound) {
+		if _, err := fixture.store.GetRoom("room"); !errors.Is(err, relayroom.ErrNotFound) {
 			t.Fatalf("unauthorized PUT mutated store: %v", err)
 		}
 	})
 
 	t.Run("correct token reaches store", func(t *testing.T) {
-		fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+		fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 		response := serveHandler(t, fixture.handler, http.MethodGet, "/v1/rooms/missing", nil, controlBearer, "")
 		assertErrorResponse(t, response, http.StatusNotFound, "not_found", notFoundMessage)
 	})
@@ -185,14 +185,14 @@ func TestHandlerAuthenticatesAndRoutesCanonically(t *testing.T) {
 	}
 	for _, tt := range routeTests {
 		t.Run(tt.name, func(t *testing.T) {
-			fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+			fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 			response := serveHandler(t, fixture.handler, tt.method, tt.path, nil, controlBearer, "")
 			assertErrorResponse(t, response, tt.status, tt.code, tt.msg)
 		})
 	}
 
 	t.Run("unsupported method advertises exact methods", func(t *testing.T) {
-		fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+		fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 		response := serveHandler(t, fixture.handler, http.MethodPost, "/v1/rooms/room", nil, controlBearer, "")
 		assertErrorResponse(t, response, http.StatusMethodNotAllowed, "method_not_allowed", methodMessage)
 		if got := response.Header().Get("Allow"); got != "PUT, GET, DELETE" {
@@ -202,14 +202,14 @@ func TestHandlerAuthenticatesAndRoutesCanonically(t *testing.T) {
 
 	for _, method := range []string{http.MethodGet, http.MethodDelete} {
 		t.Run(method+" rejects body", func(t *testing.T) {
-			fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+			fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 			response := serveHandler(t, fixture.handler, method, "/v1/rooms/room", strings.NewReader("{}"), controlBearer, "application/json")
 			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request", invalidMessage)
 		})
 	}
 
 	t.Run("DELETE is idempotent and bodyless", func(t *testing.T) {
-		fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+		fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 		for range 2 {
 			response := serveHandler(t, fixture.handler, http.MethodDelete, "/v1/rooms/never-created", nil, controlBearer, "")
 			if response.Code != http.StatusNoContent || response.Body.Len() != 0 {
@@ -255,17 +255,17 @@ func TestPutRejectsNonCanonicalOrUnboundedJSON(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+			fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 			response := serveHandler(t, fixture.handler, http.MethodPut, "/v1/rooms/room", strings.NewReader(tt.body), controlBearer, tt.contentType)
 			assertErrorResponse(t, response, tt.status, tt.code, tt.message)
-			if _, err := fixture.store.GetRoom("room"); !errors.Is(err, store.ErrNotFound) {
+			if _, err := fixture.store.GetRoom("room"); !errors.Is(err, relayroom.ErrNotFound) {
 				t.Fatalf("rejected request mutated store: %v", err)
 			}
 		})
 	}
 
 	t.Run("JSON media type parameters are accepted", func(t *testing.T) {
-		fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+		fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 		response := serveHandler(t, fixture.handler, http.MethodPut, "/v1/rooms/room", strings.NewReader(valid), controlBearer, "application/json; charset=utf-8")
 		if response.Code != http.StatusCreated {
 			t.Fatalf("PUT = %d %q", response.Code, response.Body.String())
@@ -273,7 +273,7 @@ func TestPutRejectsNonCanonicalOrUnboundedJSON(t *testing.T) {
 	})
 
 	t.Run("exact body cap is accepted", func(t *testing.T) {
-		fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+		fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 		body := append([]byte(valid), bytes.Repeat([]byte{' '}, testBodyLimit-len(valid))...)
 		response := serveHandler(t, fixture.handler, http.MethodPut, "/v1/rooms/room", bytes.NewReader(body), controlBearer, "application/json")
 		if response.Code != http.StatusCreated {
@@ -282,7 +282,7 @@ func TestPutRejectsNonCanonicalOrUnboundedJSON(t *testing.T) {
 	})
 
 	t.Run("body cap plus one is rejected", func(t *testing.T) {
-		fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+		fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 		body := append([]byte(valid), bytes.Repeat([]byte{' '}, testBodyLimit+1-len(valid))...)
 		response := serveHandler(t, fixture.handler, http.MethodPut, "/v1/rooms/room", bytes.NewReader(body), controlBearer, "application/json")
 		assertErrorResponse(t, response, http.StatusRequestEntityTooLarge, "body_too_large", tooLargeMessage)
@@ -373,7 +373,7 @@ func TestPutValidatesIDsCapacityAndTTLs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+			fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 			response := serveHandler(t, fixture.handler, http.MethodPut, "/v1/rooms/"+tt.roomID, bytes.NewReader(tt.body(t)), controlBearer, "application/json")
 			if tt.status == http.StatusCreated {
 				if response.Code != tt.status {
@@ -388,7 +388,7 @@ func TestPutValidatesIDsCapacityAndTTLs(t *testing.T) {
 
 func TestRoomHTTPResponsesAreExactIdempotentAndRedacted(t *testing.T) {
 	random := &testSequenceReader{}
-	fixture := newControlFixture(t, store.DefaultLimits(), random, nil)
+	fixture := newControlFixture(t, relayroom.DefaultLimits(), random, nil)
 	participants := []testParticipantSpec{
 		{"bob", "session-b", 90 * time.Minute},
 		{"alice", "session-a", time.Hour},
@@ -463,7 +463,7 @@ func TestRoomHTTPResponsesAreExactIdempotentAndRedacted(t *testing.T) {
 }
 
 func TestTerminalAndMissingRoomsReturnNotFoundBeforeSweep(t *testing.T) {
-	fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+	fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 	body := createRoomBody(t, controlTestWall, 2*time.Hour, []testParticipantSpec{{"participant", "session", time.Hour}})
 	created := serveHandler(t, fixture.handler, http.MethodPut, "/v1/rooms/room", bytes.NewReader(body), controlBearer, "application/json")
 	if created.Code != http.StatusCreated {
@@ -480,7 +480,7 @@ func TestTerminalAndMissingRoomsReturnNotFoundBeforeSweep(t *testing.T) {
 
 func TestStoreErrorsHaveFixedHTTPMappings(t *testing.T) {
 	t.Run("configured capacity", func(t *testing.T) {
-		limits := store.DefaultLimits()
+		limits := relayroom.DefaultLimits()
 		limits.MaxOpenRooms = 1
 		limits.MaxRoomRecords = 1
 		var fatalCalls atomic.Int32
@@ -503,7 +503,7 @@ func TestStoreErrorsHaveFixedHTTPMappings(t *testing.T) {
 		random := &failOnceReader{delegate: &testSequenceReader{}}
 		var failed *httptest.ResponseRecorder
 		fatalCalls := 0
-		fixture := newControlFixture(t, store.DefaultLimits(), random, func(config *Config) {
+		fixture := newControlFixture(t, relayroom.DefaultLimits(), random, func(config *Config) {
 			config.Fatal = func() {
 				fatalCalls++
 				assertErrorResponse(t, failed, http.StatusInternalServerError, "internal_error", internalMessage)
@@ -519,7 +519,7 @@ func TestStoreErrorsHaveFixedHTTPMappings(t *testing.T) {
 		if fatalCalls != 1 {
 			t.Fatalf("fatal random sent %d fatal notifications, want 1", fatalCalls)
 		}
-		if _, err := fixture.store.GetRoom("room"); !errors.Is(err, store.ErrNotFound) {
+		if _, err := fixture.store.GetRoom("room"); !errors.Is(err, relayroom.ErrNotFound) {
 			t.Fatalf("fatal random left partial room: %v", err)
 		}
 		retry := serveHandler(t, fixture.handler, http.MethodPut, "/v1/rooms/room", bytes.NewReader(body), controlBearer, "application/json")
@@ -531,7 +531,7 @@ func TestStoreErrorsHaveFixedHTTPMappings(t *testing.T) {
 
 func TestAdmissionRejectsBeforeReadingBody(t *testing.T) {
 	t.Run("rate", func(t *testing.T) {
-		fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, func(config *Config) {
+		fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, func(config *Config) {
 			config.RequestRate = 1
 			config.RequestBurst = 1
 		})
@@ -546,7 +546,7 @@ func TestAdmissionRejectsBeforeReadingBody(t *testing.T) {
 	})
 
 	t.Run("concurrency", func(t *testing.T) {
-		fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, func(config *Config) {
+		fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, func(config *Config) {
 			config.MaxConcurrent = 1
 		})
 		blocking := &blockingReader{started: make(chan struct{}), release: make(chan struct{})}
@@ -582,7 +582,7 @@ func TestAdmissionRejectsBeforeReadingBody(t *testing.T) {
 }
 
 func TestNewHandlerRejectsInvalidConfigLimits(t *testing.T) {
-	fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+	fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 	valid := fixture.config
 	tests := []struct {
 		name   string
@@ -590,15 +590,15 @@ func TestNewHandlerRejectsInvalidConfigLimits(t *testing.T) {
 	}{
 		{"zero rate", func(config *Config) { config.RequestRate = 0 }},
 		{"negative rate", func(config *Config) { config.RequestRate = -1 }},
-		{"rate above maximum", func(config *Config) { config.RequestRate = HardManagementRequestRate + 0.01 }},
+		{"rate above maximum", func(config *Config) { config.RequestRate = HardOperatorRequestRate + 0.01 }},
 		{"infinite rate", func(config *Config) { config.RequestRate = rate.Inf }},
 		{"NaN rate", func(config *Config) { config.RequestRate = rate.Limit(math.NaN()) }},
 		{"zero burst", func(config *Config) { config.RequestBurst = 0 }},
 		{"negative burst", func(config *Config) { config.RequestBurst = -1 }},
-		{"burst above maximum", func(config *Config) { config.RequestBurst = HardManagementRequestBurst + 1 }},
+		{"burst above maximum", func(config *Config) { config.RequestBurst = HardOperatorRequestBurst + 1 }},
 		{"zero concurrency", func(config *Config) { config.MaxConcurrent = 0 }},
 		{"negative concurrency", func(config *Config) { config.MaxConcurrent = -1 }},
-		{"concurrency above maximum", func(config *Config) { config.MaxConcurrent = HardManagementConcurrent + 1 }},
+		{"concurrency above maximum", func(config *Config) { config.MaxConcurrent = HardOperatorConcurrent + 1 }},
 		{"all-zero operator token", func(config *Config) { config.OperatorToken = [32]byte{} }},
 		{"empty advertised host", func(config *Config) { config.AdvertisedHost = "" }},
 		{"zero advertised port", func(config *Config) { config.AdvertisedPort = 0 }},
@@ -660,7 +660,7 @@ func TestBoundedServerRejectsOversizedHeaderBeforeHandler(t *testing.T) {
 }
 
 func TestBoundedServerDoesNotExposeGeneralOptions(t *testing.T) {
-	fixture := newControlFixture(t, store.DefaultLimits(), &testSequenceReader{}, nil)
+	fixture := newControlFixture(t, relayroom.DefaultLimits(), &testSequenceReader{}, nil)
 	address := startTestServer(t, fixture.handler)
 	connection, err := net.Dial("tcp", address)
 	if err != nil {
@@ -780,16 +780,16 @@ type testGetResponse struct {
 
 type controlFixture struct {
 	handler      http.Handler
-	store        *store.Store
-	playerTokens *playerauth.Auth
+	store        *relayroom.Store
+	playerTokens *playerauth.Issuer
 	fakeClock    *controlStoreClock
 	config       Config
 }
 
-func newControlFixture(t *testing.T, limits store.Limits, random io.Reader, mutate func(*Config)) controlFixture {
+func newControlFixture(t *testing.T, limits relayroom.Limits, random io.Reader, mutate func(*Config)) controlFixture {
 	t.Helper()
 	fakeClock := &controlStoreClock{reading: clock.Reading{Wall: controlTestWall, Mono: 0}}
-	roomStore, err := store.New(store.Config{Limits: limits, Now: fakeClock.now, Random: random})
+	roomStore, err := relayroom.New(relayroom.Config{Limits: limits, Now: fakeClock.now, Random: random})
 	if err != nil {
 		t.Fatalf("store.New(): %v", err)
 	}
@@ -807,9 +807,9 @@ func newControlFixture(t *testing.T, limits store.Limits, random io.Reader, muta
 		PlayerTokens:   playerTokens,
 		AdvertisedHost: "relay.example.net",
 		AdvertisedPort: 30000,
-		RequestRate:    HardManagementRequestRate,
-		RequestBurst:   HardManagementRequestBurst,
-		MaxConcurrent:  HardManagementConcurrent,
+		RequestRate:    HardOperatorRequestRate,
+		RequestBurst:   HardOperatorRequestBurst,
+		MaxConcurrent:  HardOperatorConcurrent,
 		Now:            func() time.Time { return controlTestWall },
 	}
 	if mutate != nil {
@@ -855,16 +855,16 @@ func participantSpecs(count int, ttl time.Duration) []testParticipantSpec {
 	return participants
 }
 
-func testStoreDefinition(wall time.Time, count int) store.RoomDefinition {
-	participants := make([]store.ParticipantDefinition, count)
+func testRoomSpec(wall time.Time, count int) relayroom.RoomSpec {
+	participants := make([]relayroom.ParticipantSpec, count)
 	for index := range participants {
-		participants[index] = store.ParticipantDefinition{
+		participants[index] = relayroom.ParticipantSpec{
 			ParticipantID:  "participant-" + string(rune('a'+index)),
 			SessionID:      "session-" + string(rune('a'+index)),
 			GrantExpiresAt: wall.Add(time.Hour),
 		}
 	}
-	return store.RoomDefinition{Capacity: uint32(count), ExpiresAt: wall.Add(2 * time.Hour), Participants: participants}
+	return relayroom.RoomSpec{Capacity: uint32(count), ExpiresAt: wall.Add(2 * time.Hour), Participants: participants}
 }
 
 func serveHandler(t *testing.T, handler http.Handler, method, target string, body io.Reader, authorization, contentType string) *httptest.ResponseRecorder {

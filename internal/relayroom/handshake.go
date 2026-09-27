@@ -1,4 +1,4 @@
-package store
+package relayroom
 
 import (
 	"io"
@@ -9,7 +9,7 @@ import (
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
 )
 
-type ChallengeRequest struct {
+type HelloRequest struct {
 	RoomID, SessionID string
 	GrantID           protocol.Bytes16
 	ClientNonce       protocol.Bytes16
@@ -23,7 +23,7 @@ type ChallengeResult struct {
 	ExpiresUnixMS int64
 }
 
-type AuthenticateRequest struct {
+type AuthRequest struct {
 	RoomID, SessionID string
 	CandidateID       protocol.Bytes16
 	Endpoint          netip.AddrPort
@@ -65,7 +65,7 @@ type bindingRecord struct {
 	replay     replayWindow
 }
 
-func (store *Store) BeginChallenge(request ChallengeRequest) (ChallengeResult, RejectReason) {
+func (store *Store) AdmitHello(request HelloRequest) (ChallengeResult, RejectReason) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	reading := store.now()
@@ -89,8 +89,8 @@ func (store *Store) BeginChallenge(request ChallengeRequest) (ChallengeResult, R
 	if request.SessionID != grant.sessionID {
 		return ChallengeResult{}, RejectAuthFailed
 	}
-	store.expireRelay(grant, reading.Mono)
-	if pending := grant.pending; pending != nil {
+	store.expireRelayState(grant, reading.Mono)
+	if pending := grant.pendingChallenge; pending != nil {
 		if pending.endpoint != request.Endpoint {
 			return ChallengeResult{}, RejectWrongEndpoint
 		}
@@ -99,7 +99,7 @@ func (store *Store) BeginChallenge(request ChallengeRequest) (ChallengeResult, R
 		}
 		return pending.result, RejectNone
 	}
-	if grant.recent != nil && grant.recent.clientNonce == request.ClientNonce {
+	if grant.lastHandshake != nil && grant.lastHandshake.clientNonce == request.ClientNonce {
 		return ChallengeResult{}, RejectAuthFailed
 	}
 
@@ -118,7 +118,7 @@ func (store *Store) BeginChallenge(request ChallengeRequest) (ChallengeResult, R
 		ServerNonce:   serverNonce,
 		ExpiresUnixMS: projectWireExpiryUnixMS(reading, deadline),
 	}
-	grant.pending = &challengeRecord{
+	grant.pendingChallenge = &challengeRecord{
 		candidateID: candidateID,
 		clientNonce: request.ClientNonce,
 		serverNonce: serverNonce,
@@ -133,7 +133,7 @@ func (store *Store) BeginChallenge(request ChallengeRequest) (ChallengeResult, R
 	return result, RejectNone
 }
 
-func (store *Store) Authenticate(request AuthenticateRequest) (BoundResult, RejectReason) {
+func (store *Store) AdmitAuth(request AuthRequest) (BoundResult, RejectReason) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	reading := store.now()
@@ -157,12 +157,12 @@ func (store *Store) Authenticate(request AuthenticateRequest) (BoundResult, Reje
 	if request.SessionID != grant.sessionID {
 		return BoundResult{}, RejectAuthFailed
 	}
-	if recent := grant.recent; recent != nil && recent.candidateID == request.CandidateID {
+	if recent := grant.lastHandshake; recent != nil && recent.candidateID == request.CandidateID {
 		if reading.Mono >= recent.deadline {
 			if grant.binding != nil && reading.Mono >= grant.binding.deadline {
 				store.clearBinding(grant)
 			} else {
-				store.clearRecent(grant)
+				store.clearLastHandshake(grant)
 			}
 			return BoundResult{}, RejectExpired
 		}
@@ -170,7 +170,7 @@ func (store *Store) Authenticate(request AuthenticateRequest) (BoundResult, Reje
 			return BoundResult{}, RejectWrongEndpoint
 		}
 		if grant.binding == nil || grant.binding.generation != recent.generation || grant.binding.id != recent.result.BindingID {
-			store.clearRecent(grant)
+			store.clearLastHandshake(grant)
 			return BoundResult{}, RejectExpired
 		}
 		if reading.Mono >= grant.binding.deadline {
@@ -184,12 +184,12 @@ func (store *Store) Authenticate(request AuthenticateRequest) (BoundResult, Reje
 		}
 		return recent.result, RejectNone
 	}
-	pending := grant.pending
+	pending := grant.pendingChallenge
 	if pending == nil || pending.candidateID != request.CandidateID {
 		return BoundResult{}, RejectAuthFailed
 	}
 	if reading.Mono >= pending.deadline {
-		store.clearPending(grant)
+		store.clearPendingChallenge(grant)
 		return BoundResult{}, RejectExpired
 	}
 	if pending.endpoint != request.Endpoint {
@@ -234,12 +234,12 @@ func (store *Store) Authenticate(request AuthenticateRequest) (BoundResult, Reje
 		generation: completed.generation,
 	}
 
-	store.clearPending(grant)
-	store.clearRecent(grant)
+	store.clearPendingChallenge(grant)
+	store.clearLastHandshake(grant)
 	store.clearBinding(grant)
 	grant.generation = newBinding.generation
 	grant.binding = newBinding
-	grant.recent = completed
+	grant.lastHandshake = completed
 	grant.state = GrantStateBound
 	grant.bindingState = BindingStateBound
 	store.bindingsByID[bindingID] = grant
@@ -304,20 +304,20 @@ func projectWireExpiryUnixMS(reading clock.Reading, deadline time.Duration) int6
 	return milliseconds
 }
 
-func (store *Store) expireRelay(grant *grantRecord, now time.Duration) {
-	if grant.pending != nil && now >= grant.pending.deadline {
-		store.clearPending(grant)
+func (store *Store) expireRelayState(grant *grantRecord, now time.Duration) {
+	if grant.pendingChallenge != nil && now >= grant.pendingChallenge.deadline {
+		store.clearPendingChallenge(grant)
 	}
-	if grant.recent != nil && now >= grant.recent.deadline {
-		store.clearRecent(grant)
+	if grant.lastHandshake != nil && now >= grant.lastHandshake.deadline {
+		store.clearLastHandshake(grant)
 	}
 	if grant.binding != nil && now >= grant.binding.deadline {
 		store.clearBinding(grant)
 	}
 }
 
-func (store *Store) clearPending(grant *grantRecord) {
-	pending := grant.pending
+func (store *Store) clearPendingChallenge(grant *grantRecord) {
+	pending := grant.pendingChallenge
 	if pending == nil {
 		return
 	}
@@ -327,14 +327,14 @@ func (store *Store) clearPending(grant *grantRecord) {
 	pending.serverNonce = protocol.Bytes32{}
 	pending.endpoint = netip.AddrPort{}
 	pending.result = ChallengeResult{}
-	grant.pending = nil
+	grant.pendingChallenge = nil
 	if grant.binding != nil {
 		grant.bindingState = BindingStateBound
 	}
 }
 
-func (store *Store) clearRecent(grant *grantRecord) {
-	recent := grant.recent
+func (store *Store) clearLastHandshake(grant *grantRecord) {
+	recent := grant.lastHandshake
 	if recent == nil {
 		return
 	}
@@ -344,7 +344,7 @@ func (store *Store) clearRecent(grant *grantRecord) {
 	recent.serverNonce = protocol.Bytes32{}
 	recent.endpoint = netip.AddrPort{}
 	recent.result = BoundResult{}
-	grant.recent = nil
+	grant.lastHandshake = nil
 }
 
 func (store *Store) clearBinding(grant *grantRecord) {
@@ -352,8 +352,8 @@ func (store *Store) clearBinding(grant *grantRecord) {
 	if binding == nil {
 		return
 	}
-	if grant.recent != nil && grant.recent.generation == binding.generation {
-		store.clearRecent(grant)
+	if grant.lastHandshake != nil && grant.lastHandshake.generation == binding.generation {
+		store.clearLastHandshake(grant)
 	}
 	delete(store.bindingsByID, binding.id)
 	binding.id = protocol.Bytes16{}
@@ -368,9 +368,9 @@ func (store *Store) clearBinding(grant *grantRecord) {
 	}
 }
 
-func (store *Store) clearRelay(grant *grantRecord) {
-	store.clearPending(grant)
-	store.clearRecent(grant)
+func (store *Store) clearRelayState(grant *grantRecord) {
+	store.clearPendingChallenge(grant)
+	store.clearLastHandshake(grant)
 	store.clearBinding(grant)
 	grant.generation = 0
 }

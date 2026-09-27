@@ -1,4 +1,4 @@
-package store
+package relayroom
 
 import (
 	"crypto/rand"
@@ -95,7 +95,7 @@ func (store *Store) Expire() {
 		}
 
 		for _, grant := range room.grants {
-			store.expireRelay(grant, now)
+			store.expireRelayState(grant, now)
 			if grantLive(grant) && now >= grant.monoDeadline {
 				store.terminalGrant(grant, GrantStateExpired)
 			}

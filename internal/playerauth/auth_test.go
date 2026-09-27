@@ -87,7 +87,7 @@ func TestPlayerTokenIsScopedToSecretAndProcessNonce(t *testing.T) {
 		t.Fatalf("Issue: %v", err)
 	}
 
-	for name, verifier := range map[string]*Auth{
+	for name, verifier := range map[string]*Issuer{
 		"different process": newTestAuth(t, clock, 0x24, testOperatorSecret(0x43)),
 		"different secret":  newTestAuth(t, clock, 0x23, testOperatorSecret(0x44)),
 	} {
@@ -152,7 +152,7 @@ func TestPlayerAuthErrorsDoNotLeakToken(t *testing.T) {
 	}
 }
 
-func newTestAuth(t *testing.T, clock *authTestClock, nonceByte byte, secret [32]byte) *Auth {
+func newTestAuth(t *testing.T, clock *authTestClock, nonceByte byte, secret [32]byte) *Issuer {
 	t.Helper()
 	auth, err := New(Config{
 		OperatorSecret: secret,

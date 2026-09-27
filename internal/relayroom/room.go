@@ -1,4 +1,4 @@
-package store
+package relayroom
 
 import (
 	"io"
@@ -29,26 +29,26 @@ const (
 	BindingStateRevoked       BindingState = "revoked"
 )
 
-type ParticipantDefinition struct {
+type ParticipantSpec struct {
 	ParticipantID  string
 	SessionID      string
 	GrantExpiresAt time.Time
 }
 
-type RoomDefinition struct {
+type RoomSpec struct {
 	Capacity     uint32
 	ExpiresAt    time.Time
-	Participants []ParticipantDefinition
+	Participants []ParticipantSpec
 }
 
-type Allocation struct {
+type RoomAllocation struct {
 	RoomID               string
 	CreatedAt, ExpiresAt time.Time
 	Capacity             uint32
-	Grants               []GrantAllocation
+	Grants               []ParticipantGrant
 }
 
-type GrantAllocation struct {
+type ParticipantGrant struct {
 	ParticipantID, SessionID string
 	GrantID                  protocol.Bytes16
 	GrantSecret              *protocol.Bytes32
@@ -93,27 +93,27 @@ type roomRecord struct {
 }
 
 type grantRecord struct {
-	roomID         string
-	participantID  string
-	sessionID      string
-	id             protocol.Bytes16
-	secret         *protocol.Bytes32
-	expiresAt      time.Time
-	monoDeadline   time.Duration
-	state          GrantState
-	bindingState   BindingState
-	generation     uint64
-	pending        *challengeRecord
-	recent         *completedHandshake
-	binding        *bindingRecord
-	ingressPackets *rate.Limiter
-	ingressBytes   *rate.Limiter
+	roomID           string
+	participantID    string
+	sessionID        string
+	id               protocol.Bytes16
+	secret           *protocol.Bytes32
+	expiresAt        time.Time
+	monoDeadline     time.Duration
+	state            GrantState
+	bindingState     BindingState
+	generation       uint64
+	pendingChallenge *challengeRecord
+	lastHandshake    *completedHandshake
+	binding          *bindingRecord
+	ingressPackets   *rate.Limiter
+	ingressBytes     *rate.Limiter
 }
 
-func (store *Store) CreateRoom(roomID string, definition RoomDefinition) (Allocation, bool, error) {
-	canonical, err := canonicalDefinition(roomID, definition, store.limits)
+func (store *Store) CreateRoom(roomID string, roomSpec RoomSpec) (RoomAllocation, bool, error) {
+	canonical, err := canonicalSpec(roomID, roomSpec, store.limits)
 	if err != nil {
-		return Allocation{}, false, err
+		return RoomAllocation{}, false, err
 	}
 
 	store.mu.Lock()
@@ -124,18 +124,18 @@ func (store *Store) CreateRoom(roomID string, definition RoomDefinition) (Alloca
 		switch existing.state {
 		case roomStateTombstone:
 			if reading.Mono < existing.tombstoneDeadline {
-				return Allocation{}, false, ErrConflict
+				return RoomAllocation{}, false, ErrConflict
 			}
 			delete(store.roomsByID, roomID)
 		case roomStateEmpty:
-			return Allocation{}, false, ErrConflict
+			return RoomAllocation{}, false, ErrConflict
 		case roomStateOpen:
-			if roomAccessTerminal(existing, reading.Mono) || !sameDefinition(existing, canonical) {
-				return Allocation{}, false, ErrConflict
+			if roomAccessTerminal(existing, reading.Mono) || !sameSpec(existing, canonical) {
+				return RoomAllocation{}, false, ErrConflict
 			}
 			return allocationAt(roomID, existing, reading.Mono), false, nil
 		default:
-			return Allocation{}, false, ErrConflict
+			return RoomAllocation{}, false, ErrConflict
 		}
 	}
 
@@ -143,20 +143,20 @@ func (store *Store) CreateRoom(roomID string, definition RoomDefinition) (Alloca
 	roomTTL := canonical.expiresAt.Sub(wall)
 	roomDeadline, ok := clock.DeadlineAfter(reading.Mono, roomTTL)
 	if !ok || roomTTL > store.limits.MaxRoomTTL {
-		return Allocation{}, false, ErrInvalid
+		return RoomAllocation{}, false, ErrInvalid
 	}
 	grantDeadlines := make([]time.Duration, len(canonical.participants))
 	for index, participant := range canonical.participants {
 		grantTTL := participant.GrantExpiresAt.Sub(wall)
 		grantDeadlines[index], ok = clock.DeadlineAfter(reading.Mono, grantTTL)
 		if !ok || grantTTL > store.limits.MaxGrantTTL {
-			return Allocation{}, false, ErrInvalid
+			return RoomAllocation{}, false, ErrInvalid
 		}
 	}
 	if store.openRooms >= store.limits.MaxOpenRooms ||
 		len(store.roomsByID) >= store.limits.MaxRoomRecords ||
 		store.activeSessions > store.limits.MaxActiveSessions-len(canonical.participants) {
-		return Allocation{}, false, ErrCapacity
+		return RoomAllocation{}, false, ErrCapacity
 	}
 
 	// ponytail: CSPRNG reads stay under the one store lock; split reservation/commit only if profiling shows contention.
@@ -165,11 +165,11 @@ func (store *Store) CreateRoom(roomID string, definition RoomDefinition) (Alloca
 	for index, participant := range canonical.participants {
 		grantID, ok := store.uniqueGrantID(stagedIDs)
 		if !ok {
-			return Allocation{}, false, ErrFatalRandom
+			return RoomAllocation{}, false, ErrFatalRandom
 		}
 		var secret protocol.Bytes32
 		if _, err := io.ReadFull(store.random, secret[:]); err != nil {
-			return Allocation{}, false, ErrFatalRandom
+			return RoomAllocation{}, false, ErrFatalRandom
 		}
 		secretCopy := secret
 		grant := &grantRecord{
@@ -245,44 +245,44 @@ func (store *Store) EndRoom(roomID string) error {
 	return nil
 }
 
-type normalizedDefinition struct {
+type normalizedSpec struct {
 	capacity     uint32
 	expiresAt    time.Time
-	participants []ParticipantDefinition
+	participants []ParticipantSpec
 }
 
-func canonicalDefinition(roomID string, definition RoomDefinition, limits Limits) (normalizedDefinition, error) {
-	if !protocol.ValidID(roomID) || definition.Capacity == 0 || len(definition.Participants) == 0 ||
-		uint64(definition.Capacity) != uint64(len(definition.Participants)) {
-		return normalizedDefinition{}, ErrInvalid
+func canonicalSpec(roomID string, roomSpec RoomSpec, limits Limits) (normalizedSpec, error) {
+	if !protocol.ValidID(roomID) || roomSpec.Capacity == 0 || len(roomSpec.Participants) == 0 ||
+		uint64(roomSpec.Capacity) != uint64(len(roomSpec.Participants)) {
+		return normalizedSpec{}, ErrInvalid
 	}
-	if uint64(definition.Capacity) > uint64(limits.MaxRoomCapacity) || len(definition.Participants) > limits.MaxRoomCapacity {
-		return normalizedDefinition{}, ErrCapacity
+	if uint64(roomSpec.Capacity) > uint64(limits.MaxRoomCapacity) || len(roomSpec.Participants) > limits.MaxRoomCapacity {
+		return normalizedSpec{}, ErrCapacity
 	}
-	expiresAt := definition.ExpiresAt.UTC()
+	expiresAt := roomSpec.ExpiresAt.UTC()
 	if expiresAt.IsZero() {
-		return normalizedDefinition{}, ErrInvalid
+		return normalizedSpec{}, ErrInvalid
 	}
 
-	participants := append([]ParticipantDefinition(nil), definition.Participants...)
+	participants := append([]ParticipantSpec(nil), roomSpec.Participants...)
 	participantIDs := make(map[string]struct{}, len(participants))
 	sessionIDs := make(map[string]struct{}, len(participants))
 	for index := range participants {
 		participant := &participants[index]
 		if !protocol.ValidID(participant.ParticipantID) || !protocol.ValidID(participant.SessionID) || participant.GrantExpiresAt.IsZero() {
-			return normalizedDefinition{}, ErrInvalid
+			return normalizedSpec{}, ErrInvalid
 		}
 		if _, exists := participantIDs[participant.ParticipantID]; exists {
-			return normalizedDefinition{}, ErrInvalid
+			return normalizedSpec{}, ErrInvalid
 		}
 		if _, exists := sessionIDs[participant.SessionID]; exists {
-			return normalizedDefinition{}, ErrInvalid
+			return normalizedSpec{}, ErrInvalid
 		}
 		participantIDs[participant.ParticipantID] = struct{}{}
 		sessionIDs[participant.SessionID] = struct{}{}
 		participant.GrantExpiresAt = participant.GrantExpiresAt.UTC()
 		if participant.GrantExpiresAt.After(expiresAt) {
-			return normalizedDefinition{}, ErrInvalid
+			return normalizedSpec{}, ErrInvalid
 		}
 	}
 	sort.Slice(participants, func(left, right int) bool {
@@ -291,7 +291,7 @@ func canonicalDefinition(roomID string, definition RoomDefinition, limits Limits
 		}
 		return participants[left].ParticipantID < participants[right].ParticipantID
 	})
-	return normalizedDefinition{capacity: definition.Capacity, expiresAt: expiresAt, participants: participants}, nil
+	return normalizedSpec{capacity: roomSpec.Capacity, expiresAt: expiresAt, participants: participants}, nil
 }
 
 func (store *Store) uniqueGrantID(staged map[protocol.Bytes16]struct{}) (protocol.Bytes16, bool) {
@@ -311,17 +311,17 @@ func (store *Store) uniqueGrantID(staged map[protocol.Bytes16]struct{}) (protoco
 	return protocol.Bytes16{}, false
 }
 
-func allocationAt(roomID string, room *roomRecord, now time.Duration) Allocation {
-	allocation := Allocation{
+func allocationAt(roomID string, room *roomRecord, now time.Duration) RoomAllocation {
+	allocation := RoomAllocation{
 		RoomID:    roomID,
 		CreatedAt: room.createdAt,
 		ExpiresAt: room.expiresAt,
 		Capacity:  room.capacity,
-		Grants:    make([]GrantAllocation, len(room.grants)),
+		Grants:    make([]ParticipantGrant, len(room.grants)),
 	}
 	for index, grant := range room.grants {
 		state := grantStateAt(grant, now)
-		allocationGrant := GrantAllocation{
+		allocationGrant := ParticipantGrant{
 			ParticipantID:  grant.participantID,
 			SessionID:      grant.sessionID,
 			GrantID:        grant.id,
@@ -361,7 +361,7 @@ func snapshotAt(roomID string, room *roomRecord, now time.Duration) RoomSnapshot
 				if now >= grant.binding.deadline {
 					state = GrantStateIssued
 					bindingState = BindingStateExpired
-				} else if grant.pending != nil && now < grant.pending.deadline {
+				} else if grant.pendingChallenge != nil && now < grant.pendingChallenge.deadline {
 					bindingState = BindingStateRebindPending
 				} else {
 					bindingState = BindingStateBound
@@ -396,7 +396,7 @@ func (store *Store) tombstoneRoom(room *roomRecord, now time.Duration, terminalS
 }
 
 func (store *Store) terminalGrant(grant *grantRecord, terminalState GrantState) {
-	store.clearRelay(grant)
+	store.clearRelayState(grant)
 	grant.ingressPackets = nil
 	grant.ingressBytes = nil
 	if grantLive(grant) {
@@ -443,11 +443,11 @@ func grantStateAt(grant *grantRecord, now time.Duration) GrantState {
 	return grant.state
 }
 
-func sameDefinition(room *roomRecord, definition normalizedDefinition) bool {
-	if room.capacity != definition.capacity || room.expiresAt != definition.expiresAt || len(room.grants) != len(definition.participants) {
+func sameSpec(room *roomRecord, roomSpec normalizedSpec) bool {
+	if room.capacity != roomSpec.capacity || room.expiresAt != roomSpec.expiresAt || len(room.grants) != len(roomSpec.participants) {
 		return false
 	}
-	for index, participant := range definition.participants {
+	for index, participant := range roomSpec.participants {
 		grant := room.grants[index]
 		if grant.participantID != participant.ParticipantID || grant.sessionID != participant.SessionID ||
 			grant.expiresAt != participant.GrantExpiresAt {

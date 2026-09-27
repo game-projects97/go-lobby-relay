@@ -1,4 +1,4 @@
-package control
+package operatorapi
 
 import (
 	"crypto/subtle"
@@ -12,23 +12,23 @@ import (
 	"github.com/gyungsubLee/go-lobby-relay/internal/httpapi/httpx"
 	"github.com/gyungsubLee/go-lobby-relay/internal/playerauth"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
-	"github.com/gyungsubLee/go-lobby-relay/internal/store"
+	"github.com/gyungsubLee/go-lobby-relay/internal/relayroom"
 	"golang.org/x/time/rate"
 )
 
 const (
-	HardManagementRequestRate  = rate.Limit(20)
-	HardManagementRequestBurst = 40
-	HardManagementConcurrent   = 32
+	HardOperatorRequestRate  = rate.Limit(20)
+	HardOperatorRequestBurst = 40
+	HardOperatorConcurrent   = 32
 )
 
-var errInvalidConfig = errors.New("invalid control config")
+var errInvalidConfig = errors.New("invalid operator API config")
 
 var errInvalidOperatorToken = errors.New("invalid operator token")
 
 type Config struct {
 	OperatorToken  [32]byte
-	PlayerTokens   *playerauth.Auth
+	PlayerTokens   *playerauth.Issuer
 	AdvertisedHost string
 	AdvertisedPort uint16
 	RequestRate    rate.Limit
@@ -42,17 +42,17 @@ type handler struct {
 	operatorToken  [32]byte
 	advertisedHost string
 	advertisedPort uint16
-	rooms          *store.Store
-	playerTokens   *playerauth.Auth
+	rooms          *relayroom.Store
+	playerTokens   *playerauth.Issuer
 	admission      *httpx.Admission
 	fatal          func()
 }
 
-func NewHandler(config Config, rooms *store.Store) (http.Handler, error) {
+func NewHandler(config Config, rooms *relayroom.Store) (http.Handler, error) {
 	if rooms == nil || config.PlayerTokens == nil || config.OperatorToken == [32]byte{} || config.AdvertisedHost == "" || config.AdvertisedPort == 0 ||
-		!(config.RequestRate > 0 && config.RequestRate <= HardManagementRequestRate) ||
-		config.RequestBurst <= 0 || config.RequestBurst > HardManagementRequestBurst ||
-		config.MaxConcurrent <= 0 || config.MaxConcurrent > HardManagementConcurrent {
+		!(config.RequestRate > 0 && config.RequestRate <= HardOperatorRequestRate) ||
+		config.RequestBurst <= 0 || config.RequestBurst > HardOperatorRequestBurst ||
+		config.MaxConcurrent <= 0 || config.MaxConcurrent > HardOperatorConcurrent {
 		return nil, errInvalidConfig
 	}
 	return &handler{
@@ -196,15 +196,15 @@ func (handler *handler) putRoom(writer http.ResponseWriter, request *http.Reques
 	if !ok {
 		return
 	}
-	definition, ok := decodeRoomDefinition(body)
+	roomSpec, ok := decodeRoomSpec(body)
 	if !ok {
 		httpx.WriteInvalid(writer)
 		return
 	}
-	allocation, created, err := handler.rooms.CreateRoom(roomID, definition)
+	allocation, created, err := handler.rooms.CreateRoom(roomID, roomSpec)
 	if err != nil {
 		writeStoreError(writer, err)
-		if errors.Is(err, store.ErrFatalRandom) {
+		if errors.Is(err, relayroom.ErrFatalRandom) {
 			httpx.NotifyFatal(writer, handler.fatal)
 		}
 		return
@@ -243,35 +243,35 @@ type createRoomRequest struct {
 	} `json:"participants"`
 }
 
-func decodeRoomDefinition(body []byte) (store.RoomDefinition, bool) {
+func decodeRoomSpec(body []byte) (relayroom.RoomSpec, bool) {
 	if !httpx.HasUniqueFields(body) || !hasExactRoomRequestFields(body) {
-		return store.RoomDefinition{}, false
+		return relayroom.RoomSpec{}, false
 	}
 	var request createRoomRequest
 	if !httpx.DecodeStrict(body, &request) {
-		return store.RoomDefinition{}, false
+		return relayroom.RoomSpec{}, false
 	}
 	expiresAt, ok := canonicalUTCTime(request.ExpiresAt)
 	if !ok {
-		return store.RoomDefinition{}, false
+		return relayroom.RoomSpec{}, false
 	}
-	definition := store.RoomDefinition{
+	roomSpec := relayroom.RoomSpec{
 		Capacity:     request.Capacity,
 		ExpiresAt:    expiresAt,
-		Participants: make([]store.ParticipantDefinition, len(request.Participants)),
+		Participants: make([]relayroom.ParticipantSpec, len(request.Participants)),
 	}
 	for index, participant := range request.Participants {
 		grantExpiresAt, ok := canonicalUTCTime(participant.GrantExpiresAt)
 		if !ok {
-			return store.RoomDefinition{}, false
+			return relayroom.RoomSpec{}, false
 		}
-		definition.Participants[index] = store.ParticipantDefinition{
+		roomSpec.Participants[index] = relayroom.ParticipantSpec{
 			ParticipantID:  participant.ParticipantID,
 			SessionID:      participant.SessionID,
 			GrantExpiresAt: grantExpiresAt,
 		}
 	}
-	return definition, true
+	return roomSpec, true
 }
 
 func hasExactRoomRequestFields(body []byte) bool {
@@ -343,7 +343,7 @@ type participantResponse struct {
 	BindingState   string `json:"binding_state"`
 }
 
-func allocationResponse(allocation store.Allocation, host string, port uint16) createRoomResponse {
+func allocationResponse(allocation relayroom.RoomAllocation, host string, port uint16) createRoomResponse {
 	response := createRoomResponse{
 		roomCommonResponse: commonResponse(allocation.RoomID, allocation.CreatedAt, allocation.ExpiresAt, allocation.Capacity, host, port),
 		Grants:             make([]grantResponse, len(allocation.Grants)),
@@ -365,7 +365,7 @@ func allocationResponse(allocation store.Allocation, host string, port uint16) c
 	return response
 }
 
-func snapshotResponse(snapshot store.RoomSnapshot, host string, port uint16) getRoomResponse {
+func snapshotResponse(snapshot relayroom.RoomSnapshot, host string, port uint16) getRoomResponse {
 	response := getRoomResponse{
 		roomCommonResponse: commonResponse(snapshot.RoomID, snapshot.CreatedAt, snapshot.ExpiresAt, snapshot.Capacity, host, port),
 		Participants:       make([]participantResponse, len(snapshot.Participants)),
@@ -398,13 +398,13 @@ func commonResponse(roomID string, createdAt, expiresAt time.Time, capacity uint
 
 func writeStoreError(writer http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, store.ErrInvalid):
+	case errors.Is(err, relayroom.ErrInvalid):
 		httpx.WriteInvalid(writer)
-	case errors.Is(err, store.ErrNotFound):
+	case errors.Is(err, relayroom.ErrNotFound):
 		httpx.WriteError(writer, http.StatusNotFound, "not_found", "room not found")
-	case errors.Is(err, store.ErrConflict):
+	case errors.Is(err, relayroom.ErrConflict):
 		httpx.WriteError(writer, http.StatusConflict, "conflict", "room_id already exists with a different immutable definition")
-	case errors.Is(err, store.ErrCapacity):
+	case errors.Is(err, relayroom.ErrCapacity):
 		httpx.WriteError(writer, http.StatusUnprocessableEntity, "capacity_exceeded", "capacity limit exceeded")
 	default:
 		httpx.WriteError(writer, http.StatusInternalServerError, "internal_error", "internal server error")

@@ -1,4 +1,4 @@
-package lobby
+package matchmaking
 
 import (
 	"errors"
@@ -6,7 +6,7 @@ import (
 
 	"github.com/gyungsubLee/go-lobby-relay/internal/clock"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
-	"github.com/gyungsubLee/go-lobby-relay/internal/store"
+	"github.com/gyungsubLee/go-lobby-relay/internal/relayroom"
 )
 
 type Assignment struct {
@@ -41,7 +41,7 @@ func (manager *Manager) allocateMatchLocked(players []string, reading clock.Read
 		if err != nil {
 			return matchAllocation{}, err
 		}
-		participants := make([]store.ParticipantDefinition, len(players))
+		participants := make([]relayroom.ParticipantSpec, len(players))
 		sessions := make(map[string]struct{}, len(players))
 		validAttempt := true
 		for index, player := range players {
@@ -57,19 +57,19 @@ func (manager *Manager) allocateMatchLocked(players []string, reading clock.Read
 				break
 			}
 			sessions[sessionID] = struct{}{}
-			participants[index] = store.ParticipantDefinition{ParticipantID: player, SessionID: sessionID, GrantExpiresAt: expiresAt}
+			participants[index] = relayroom.ParticipantSpec{ParticipantID: player, SessionID: sessionID, GrantExpiresAt: expiresAt}
 		}
 		if !validAttempt {
 			continue
 		}
-		allocation, created, allocationErr := manager.rooms.CreateRoom(roomID, store.RoomDefinition{
+		allocation, created, allocationErr := manager.rooms.CreateRoom(roomID, relayroom.RoomSpec{
 			Capacity: uint32(len(players)), ExpiresAt: expiresAt, Participants: participants,
 		})
-		if errors.Is(allocationErr, store.ErrConflict) || allocationErr == nil && !created {
+		if errors.Is(allocationErr, relayroom.ErrConflict) || allocationErr == nil && !created {
 			continue
 		}
 		if allocationErr != nil {
-			return matchAllocation{}, mapStoreError(allocationErr)
+			return matchAllocation{}, mapRoomError(allocationErr)
 		}
 		assignments := make(map[string]Assignment, len(players))
 		for _, grant := range allocation.Grants {
@@ -91,11 +91,11 @@ func (manager *Manager) allocateMatchLocked(players []string, reading clock.Read
 	return matchAllocation{}, ErrFatalRandom
 }
 
-func mapStoreError(err error) error {
+func mapRoomError(err error) error {
 	switch {
-	case errors.Is(err, store.ErrFatalRandom):
+	case errors.Is(err, relayroom.ErrFatalRandom):
 		return ErrFatalRandom
-	case errors.Is(err, store.ErrCapacity):
+	case errors.Is(err, relayroom.ErrCapacity):
 		return ErrUnavailable
 	default:
 		return ErrUnavailable

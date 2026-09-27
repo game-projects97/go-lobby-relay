@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/gyungsubLee/go-lobby-relay/internal/httpapi/httpx"
-	"github.com/gyungsubLee/go-lobby-relay/internal/lobby"
+	"github.com/gyungsubLee/go-lobby-relay/internal/matchmaking"
 	"github.com/gyungsubLee/go-lobby-relay/internal/playerauth"
 	"golang.org/x/time/rate"
 )
@@ -23,8 +23,8 @@ const (
 var errInvalidConfig = errors.New("invalid player API config")
 
 type Config struct {
-	PlayerTokens   *playerauth.Auth
-	Lobbies        *lobby.Manager
+	PlayerTokens   *playerauth.Issuer
+	Lobbies        *matchmaking.Manager
 	AdvertisedHost string
 	AdvertisedPort uint16
 	RequestRate    rate.Limit
@@ -35,8 +35,8 @@ type Config struct {
 }
 
 type handler struct {
-	playerTokens   *playerauth.Auth
-	lobbies        *lobby.Manager
+	playerTokens   *playerauth.Issuer
+	lobbies        *matchmaking.Manager
 	advertisedHost string
 	advertisedPort uint16
 	admission      *httpx.Admission
@@ -98,13 +98,13 @@ func (handler *handler) route(writer http.ResponseWriter, request *http.Request,
 	}
 	switch request.URL.Path {
 	case "/v1/lobbies":
-		handler.lobbiesRoute(writer, request, playerID)
+		handler.handleLobbies(writer, request, playerID)
 		return
 	case "/v1/matchmaking/tickets":
-		handler.ticketsRoute(writer, request, playerID)
+		handler.handleTickets(writer, request, playerID)
 		return
 	case "/v1/matchmaking/tickets/me":
-		handler.myTicketRoute(writer, request, playerID)
+		handler.handleMyTicket(writer, request, playerID)
 		return
 	}
 	const prefix = "/v1/lobbies/"
@@ -121,21 +121,21 @@ func (handler *handler) route(writer http.ResponseWriter, request *http.Request,
 	lobbyID := parts[0]
 	switch {
 	case len(parts) == 1:
-		handler.oneLobbyRoute(writer, request, playerID, lobbyID)
+		handler.handleLobby(writer, request, playerID, lobbyID)
 	case len(parts) == 2 && parts[1] == "join":
-		handler.revisionRoute(writer, request, http.MethodPost, func(revision uint64) (any, error) { return handler.lobbies.Join(playerID, lobbyID, revision) })
+		handler.handleRevisionAction(writer, request, http.MethodPost, func(revision uint64) (any, error) { return handler.lobbies.JoinLobby(playerID, lobbyID, revision) })
 	case len(parts) == 2 && parts[1] == "start":
-		handler.revisionRoute(writer, request, http.MethodPost, func(revision uint64) (any, error) { return handler.lobbies.Start(playerID, lobbyID, revision) })
+		handler.handleRevisionAction(writer, request, http.MethodPost, func(revision uint64) (any, error) { return handler.lobbies.StartMatch(playerID, lobbyID, revision) })
 	case len(parts) == 3 && parts[1] == "members" && parts[2] == "me":
-		handler.revisionRoute(writer, request, http.MethodDelete, func(revision uint64) (any, error) { return handler.lobbies.Leave(playerID, lobbyID, revision) })
+		handler.handleRevisionAction(writer, request, http.MethodDelete, func(revision uint64) (any, error) { return handler.lobbies.LeaveLobby(playerID, lobbyID, revision) })
 	case len(parts) == 4 && parts[1] == "members" && parts[2] == "me" && parts[3] == "ready":
-		handler.readyRoute(writer, request, playerID, lobbyID)
+		handler.handleReady(writer, request, playerID, lobbyID)
 	default:
 		httpx.WriteError(writer, http.StatusNotFound, "not_found", "resource not found")
 	}
 }
 
-func (handler *handler) lobbiesRoute(writer http.ResponseWriter, request *http.Request, playerID string) {
+func (handler *handler) handleLobbies(writer http.ResponseWriter, request *http.Request, playerID string) {
 	switch request.Method {
 	case http.MethodPost:
 		if len(request.URL.Query()) != 0 {
@@ -143,14 +143,14 @@ func (handler *handler) lobbiesRoute(writer http.ResponseWriter, request *http.R
 			return
 		}
 		var body struct {
-			Visibility lobby.Visibility `json:"visibility"`
-			QueueKey   string           `json:"queue_key"`
-			Capacity   uint32           `json:"capacity"`
+			Visibility matchmaking.Visibility `json:"visibility"`
+			QueueKey   string                 `json:"queue_key"`
+			Capacity   uint32                 `json:"capacity"`
 		}
 		if !httpx.DecodeExact(writer, request, &body, "visibility", "queue_key", "capacity") {
 			return
 		}
-		result, err := handler.lobbies.Create(playerID, lobby.CreateRequest{Visibility: body.Visibility, QueueKey: body.QueueKey, Capacity: body.Capacity})
+		result, err := handler.lobbies.CreateLobby(playerID, matchmaking.CreateLobbyRequest{Visibility: body.Visibility, QueueKey: body.QueueKey, Capacity: body.Capacity})
 		handler.writeResult(writer, http.StatusCreated, encodeLobby(result, handler.advertisedHost, handler.advertisedPort), err)
 	case http.MethodGet:
 		if httpx.RequestHasBody(request) {
@@ -183,14 +183,14 @@ func (handler *handler) lobbiesRoute(writer http.ResponseWriter, request *http.R
 			}
 			cursor = values[0]
 		}
-		page, listErr := handler.lobbies.List(query.Get("queue_key"), cursor, limit)
-		handler.writeResult(writer, http.StatusOK, pageResponse(page), listErr)
+		page, listErr := handler.lobbies.ListLobbies(query.Get("queue_key"), cursor, limit)
+		handler.writeResult(writer, http.StatusOK, lobbyPageResponse(page), listErr)
 	default:
 		httpx.WriteMethodNotAllowed(writer, "POST, GET")
 	}
 }
 
-func (handler *handler) oneLobbyRoute(writer http.ResponseWriter, request *http.Request, playerID, lobbyID string) {
+func (handler *handler) handleLobby(writer http.ResponseWriter, request *http.Request, playerID, lobbyID string) {
 	if request.Method != http.MethodGet {
 		httpx.WriteMethodNotAllowed(writer, "GET")
 		return
@@ -199,11 +199,11 @@ func (handler *handler) oneLobbyRoute(writer http.ResponseWriter, request *http.
 		httpx.WriteInvalid(writer)
 		return
 	}
-	result, err := handler.lobbies.Get(playerID, lobbyID)
+	result, err := handler.lobbies.GetLobby(playerID, lobbyID)
 	handler.writeResult(writer, http.StatusOK, encodeLobby(result, handler.advertisedHost, handler.advertisedPort), err)
 }
 
-func (handler *handler) revisionRoute(writer http.ResponseWriter, request *http.Request, method string, action func(uint64) (any, error)) {
+func (handler *handler) handleRevisionAction(writer http.ResponseWriter, request *http.Request, method string, action func(uint64) (any, error)) {
 	if request.Method != method {
 		httpx.WriteMethodNotAllowed(writer, method)
 		return
@@ -219,10 +219,10 @@ func (handler *handler) revisionRoute(writer http.ResponseWriter, request *http.
 		return
 	}
 	result, err := action(body.Revision)
-	handler.writeResult(writer, http.StatusOK, handler.response(result), err)
+	handler.writeResult(writer, http.StatusOK, handler.encodeActionResult(result), err)
 }
 
-func (handler *handler) readyRoute(writer http.ResponseWriter, request *http.Request, playerID, lobbyID string) {
+func (handler *handler) handleReady(writer http.ResponseWriter, request *http.Request, playerID, lobbyID string) {
 	if request.Method != http.MethodPut {
 		httpx.WriteMethodNotAllowed(writer, "PUT")
 		return
@@ -242,7 +242,7 @@ func (handler *handler) readyRoute(writer http.ResponseWriter, request *http.Req
 	handler.writeResult(writer, http.StatusOK, encodeLobby(result, handler.advertisedHost, handler.advertisedPort), err)
 }
 
-func (handler *handler) ticketsRoute(writer http.ResponseWriter, request *http.Request, playerID string) {
+func (handler *handler) handleTickets(writer http.ResponseWriter, request *http.Request, playerID string) {
 	if request.Method != http.MethodPost {
 		httpx.WriteMethodNotAllowed(writer, "POST")
 		return
@@ -258,11 +258,11 @@ func (handler *handler) ticketsRoute(writer http.ResponseWriter, request *http.R
 	if !httpx.DecodeExact(writer, request, &body, "queue_key", "capacity") {
 		return
 	}
-	result, err := handler.lobbies.Enqueue(playerID, lobby.EnqueueRequest{QueueKey: body.QueueKey, Capacity: body.Capacity})
+	result, err := handler.lobbies.CreateTicket(playerID, matchmaking.CreateTicketRequest{QueueKey: body.QueueKey, Capacity: body.Capacity})
 	handler.writeResult(writer, http.StatusCreated, encodeTicket(result, handler.advertisedHost, handler.advertisedPort), err)
 }
 
-func (handler *handler) myTicketRoute(writer http.ResponseWriter, request *http.Request, playerID string) {
+func (handler *handler) handleMyTicket(writer http.ResponseWriter, request *http.Request, playerID string) {
 	switch request.Method {
 	case http.MethodGet:
 		if httpx.RequestHasBody(request) || len(request.URL.Query()) != 0 {
@@ -289,11 +289,11 @@ func (handler *handler) myTicketRoute(writer http.ResponseWriter, request *http.
 	}
 }
 
-func (handler *handler) response(value any) any {
+func (handler *handler) encodeActionResult(value any) any {
 	switch typed := value.(type) {
-	case lobby.LobbySnapshot:
+	case matchmaking.LobbySnapshot:
 		return encodeLobby(typed, handler.advertisedHost, handler.advertisedPort)
-	case lobby.Assignment:
+	case matchmaking.Assignment:
 		return encodeAssignment(typed, handler.advertisedHost, handler.advertisedPort)
 	default:
 		return value
@@ -306,87 +306,87 @@ func (handler *handler) writeResult(writer http.ResponseWriter, status int, valu
 		return
 	}
 	switch {
-	case errors.Is(err, lobby.ErrInvalid):
+	case errors.Is(err, matchmaking.ErrInvalid):
 		httpx.WriteInvalid(writer)
-	case errors.Is(err, lobby.ErrNotFound):
+	case errors.Is(err, matchmaking.ErrNotFound):
 		httpx.WriteError(writer, http.StatusNotFound, "not_found", "resource not found")
-	case errors.Is(err, lobby.ErrConflict):
+	case errors.Is(err, matchmaking.ErrConflict):
 		httpx.WriteError(writer, http.StatusConflict, "conflict", "state or revision conflict")
-	case errors.Is(err, lobby.ErrForbidden):
+	case errors.Is(err, matchmaking.ErrForbidden):
 		httpx.WriteError(writer, http.StatusForbidden, "forbidden", "operation is not allowed")
-	case errors.Is(err, lobby.ErrCapacity):
+	case errors.Is(err, matchmaking.ErrCapacity):
 		httpx.WriteError(writer, http.StatusConflict, "capacity", "capacity limit exceeded")
-	case errors.Is(err, lobby.ErrUnavailable):
+	case errors.Is(err, matchmaking.ErrUnavailable):
 		httpx.WriteError(writer, http.StatusServiceUnavailable, "unavailable", "service temporarily unavailable")
 	default:
 		httpx.WriteError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
-		if errors.Is(err, lobby.ErrFatalRandom) {
+		if errors.Is(err, matchmaking.ErrFatalRandom) {
 			httpx.NotifyFatal(writer, handler.fatal)
 		}
 	}
 }
 
-type relayEndpoint struct {
+type relayEndpointResponse struct {
 	Host string `json:"host"`
 	Port uint16 `json:"port"`
 }
-type assignmentJSON struct {
-	MatchID        string        `json:"match_id"`
-	RoomID         string        `json:"room_id"`
-	PlayerID       string        `json:"player_id"`
-	SessionID      string        `json:"session_id"`
-	GrantID        string        `json:"grant_id"`
-	GrantSecret    string        `json:"grant_secret"`
-	GrantExpiresAt string        `json:"grant_expires_at"`
-	RelayEndpoint  relayEndpoint `json:"relay_endpoint"`
+type assignmentResponse struct {
+	MatchID        string                `json:"match_id"`
+	RoomID         string                `json:"room_id"`
+	PlayerID       string                `json:"player_id"`
+	SessionID      string                `json:"session_id"`
+	GrantID        string                `json:"grant_id"`
+	GrantSecret    string                `json:"grant_secret"`
+	GrantExpiresAt string                `json:"grant_expires_at"`
+	RelayEndpoint  relayEndpointResponse `json:"relay_endpoint"`
 }
-type lobbyJSON struct {
-	LobbyID       string           `json:"lobby_id"`
-	OwnerPlayerID string           `json:"owner_player_id"`
-	QueueKey      string           `json:"queue_key"`
-	Visibility    lobby.Visibility `json:"visibility"`
-	Capacity      uint32           `json:"capacity"`
-	Revision      uint64           `json:"revision"`
-	State         lobby.LobbyState `json:"state"`
-	Members       []memberJSON     `json:"members"`
-	ExpiresAt     string           `json:"expires_at"`
-	Assignment    *assignmentJSON  `json:"assignment,omitempty"`
+type lobbyResponse struct {
+	LobbyID       string                 `json:"lobby_id"`
+	OwnerPlayerID string                 `json:"owner_player_id"`
+	QueueKey      string                 `json:"queue_key"`
+	Visibility    matchmaking.Visibility `json:"visibility"`
+	Capacity      uint32                 `json:"capacity"`
+	Revision      uint64                 `json:"revision"`
+	State         matchmaking.LobbyState `json:"state"`
+	Members       []memberResponse       `json:"members"`
+	ExpiresAt     string                 `json:"expires_at"`
+	Assignment    *assignmentResponse    `json:"assignment,omitempty"`
 }
-type memberJSON struct {
+type memberResponse struct {
 	PlayerID string `json:"player_id"`
 	Ready    bool   `json:"ready"`
 }
-type summaryJSON struct {
-	LobbyID       string           `json:"lobby_id"`
-	OwnerPlayerID string           `json:"owner_player_id"`
-	QueueKey      string           `json:"queue_key"`
-	Visibility    lobby.Visibility `json:"visibility"`
-	Capacity      uint32           `json:"capacity"`
-	MemberCount   uint32           `json:"member_count"`
-	Revision      uint64           `json:"revision"`
-	ExpiresAt     string           `json:"expires_at"`
+type lobbySummaryResponse struct {
+	LobbyID       string                 `json:"lobby_id"`
+	OwnerPlayerID string                 `json:"owner_player_id"`
+	QueueKey      string                 `json:"queue_key"`
+	Visibility    matchmaking.Visibility `json:"visibility"`
+	Capacity      uint32                 `json:"capacity"`
+	MemberCount   uint32                 `json:"member_count"`
+	Revision      uint64                 `json:"revision"`
+	ExpiresAt     string                 `json:"expires_at"`
 }
-type ticketJSON struct {
-	TicketID   string            `json:"ticket_id"`
-	PlayerID   string            `json:"player_id"`
-	QueueKey   string            `json:"queue_key"`
-	State      lobby.TicketState `json:"state"`
-	Capacity   uint32            `json:"capacity"`
-	Revision   uint64            `json:"revision"`
-	ExpiresAt  string            `json:"expires_at"`
-	Assignment *assignmentJSON   `json:"assignment,omitempty"`
+type ticketResponse struct {
+	TicketID   string                  `json:"ticket_id"`
+	PlayerID   string                  `json:"player_id"`
+	QueueKey   string                  `json:"queue_key"`
+	State      matchmaking.TicketState `json:"state"`
+	Capacity   uint32                  `json:"capacity"`
+	Revision   uint64                  `json:"revision"`
+	ExpiresAt  string                  `json:"expires_at"`
+	Assignment *assignmentResponse     `json:"assignment,omitempty"`
 }
 
-func encodeAssignment(value lobby.Assignment, host string, port uint16) assignmentJSON {
-	return assignmentJSON{MatchID: value.MatchID, RoomID: value.RoomID, PlayerID: value.PlayerID, SessionID: value.SessionID,
+func encodeAssignment(value matchmaking.Assignment, host string, port uint16) assignmentResponse {
+	return assignmentResponse{MatchID: value.MatchID, RoomID: value.RoomID, PlayerID: value.PlayerID, SessionID: value.SessionID,
 		GrantID: base64.RawURLEncoding.EncodeToString(value.GrantID[:]), GrantSecret: base64.RawURLEncoding.EncodeToString(value.GrantSecret[:]),
-		GrantExpiresAt: value.GrantExpiresAt.UTC().Format(time.RFC3339Nano), RelayEndpoint: relayEndpoint{host, port}}
+		GrantExpiresAt: value.GrantExpiresAt.UTC().Format(time.RFC3339Nano), RelayEndpoint: relayEndpointResponse{host, port}}
 }
-func encodeLobby(value lobby.LobbySnapshot, host string, port uint16) lobbyJSON {
-	result := lobbyJSON{LobbyID: value.LobbyID, OwnerPlayerID: value.OwnerPlayerID, QueueKey: value.QueueKey, Visibility: value.Visibility,
-		Capacity: value.Capacity, Revision: value.Revision, State: value.State, Members: make([]memberJSON, len(value.Members)), ExpiresAt: value.ExpiresAt.UTC().Format(time.RFC3339Nano)}
+func encodeLobby(value matchmaking.LobbySnapshot, host string, port uint16) lobbyResponse {
+	result := lobbyResponse{LobbyID: value.LobbyID, OwnerPlayerID: value.OwnerPlayerID, QueueKey: value.QueueKey, Visibility: value.Visibility,
+		Capacity: value.Capacity, Revision: value.Revision, State: value.State, Members: make([]memberResponse, len(value.Members)), ExpiresAt: value.ExpiresAt.UTC().Format(time.RFC3339Nano)}
 	for index, member := range value.Members {
-		result.Members[index] = memberJSON{PlayerID: member.PlayerID, Ready: member.Ready}
+		result.Members[index] = memberResponse{PlayerID: member.PlayerID, Ready: member.Ready}
 	}
 	if value.Assignment != nil {
 		item := encodeAssignment(*value.Assignment, host, port)
@@ -394,8 +394,8 @@ func encodeLobby(value lobby.LobbySnapshot, host string, port uint16) lobbyJSON 
 	}
 	return result
 }
-func encodeTicket(value lobby.TicketSnapshot, host string, port uint16) ticketJSON {
-	result := ticketJSON{TicketID: value.TicketID, PlayerID: value.PlayerID, QueueKey: value.QueueKey, State: value.State,
+func encodeTicket(value matchmaking.TicketSnapshot, host string, port uint16) ticketResponse {
+	result := ticketResponse{TicketID: value.TicketID, PlayerID: value.PlayerID, QueueKey: value.QueueKey, State: value.State,
 		Capacity: value.Capacity, Revision: value.Revision, ExpiresAt: value.ExpiresAt.UTC().Format(time.RFC3339Nano)}
 	if value.Assignment != nil {
 		item := encodeAssignment(*value.Assignment, host, port)
@@ -403,15 +403,15 @@ func encodeTicket(value lobby.TicketSnapshot, host string, port uint16) ticketJS
 	}
 	return result
 }
-func pageResponse(value lobby.LobbyPage) any {
-	lobbies := make([]summaryJSON, len(value.Lobbies))
+func lobbyPageResponse(value matchmaking.LobbyPage) any {
+	lobbies := make([]lobbySummaryResponse, len(value.Lobbies))
 	for index, item := range value.Lobbies {
-		lobbies[index] = summaryJSON{LobbyID: item.LobbyID, OwnerPlayerID: item.OwnerPlayerID, QueueKey: item.QueueKey,
+		lobbies[index] = lobbySummaryResponse{LobbyID: item.LobbyID, OwnerPlayerID: item.OwnerPlayerID, QueueKey: item.QueueKey,
 			Visibility: item.Visibility, Capacity: item.Capacity, MemberCount: item.MemberCount, Revision: item.Revision,
 			ExpiresAt: item.ExpiresAt.UTC().Format(time.RFC3339Nano)}
 	}
 	return struct {
-		Lobbies    []summaryJSON `json:"lobbies"`
-		NextCursor string        `json:"next_cursor"`
+		Lobbies    []lobbySummaryResponse `json:"lobbies"`
+		NextCursor string                 `json:"next_cursor"`
 	}{lobbies, value.NextCursor}
 }

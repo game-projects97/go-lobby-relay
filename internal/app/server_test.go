@@ -1,4 +1,4 @@
-package server
+package app
 
 import (
 	"bytes"
@@ -34,8 +34,8 @@ func TestNewValidatesBeforeBinding(t *testing.T) {
 		name   string
 		mutate func(*Config)
 	}{
-		{"empty management listen", func(config *Config) { config.ManagementListen = "" }},
-		{"invalid management listen", func(config *Config) { config.ManagementListen = "127.0.0.1" }},
+		{"empty operator listen", func(config *Config) { config.OperatorListen = "" }},
+		{"invalid operator listen", func(config *Config) { config.OperatorListen = "127.0.0.1" }},
 		{"empty player listen", func(config *Config) { config.PlayerListen = "" }},
 		{"invalid player listen", func(config *Config) { config.PlayerListen = "127.0.0.1" }},
 		{"invalid relay network", func(config *Config) { config.RelayNetwork = "udp" }},
@@ -79,8 +79,8 @@ func TestNewBindsSeparatePlayerListenerWithoutServing(t *testing.T) {
 		t.Fatalf("New(): %v", err)
 	}
 	defer server.Close()
-	if server.PlayerAddr() == nil || server.PlayerAddr().String() == server.ManagementAddr().String() {
-		t.Fatalf("player/management addresses = %v/%v", server.PlayerAddr(), server.ManagementAddr())
+	if server.PlayerAddr() == nil || server.PlayerAddr().String() == server.OperatorAddr().String() {
+		t.Fatalf("player/operator addresses = %v/%v", server.PlayerAddr(), server.OperatorAddr())
 	}
 	connection, err := net.DialTimeout("tcp", server.PlayerAddr().String(), time.Second)
 	if err != nil {
@@ -131,21 +131,21 @@ func TestRunSharesHTTPStoreWithRelayAndCancelsCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(): %v", err)
 	}
-	managementAddr, relayAddr := server.ManagementAddr(), server.RelayAddr()
-	if managementAddr == nil || relayAddr == nil {
-		t.Fatalf("bound addresses = %v/%v", managementAddr, relayAddr)
+	operatorAddr, relayAddr := server.OperatorAddr(), server.RelayAddr()
+	if operatorAddr == nil || relayAddr == nil {
+		t.Fatalf("bound addresses = %v/%v", operatorAddr, relayAddr)
 	}
 	if server.runStarted {
 		t.Fatal("New started work before Run")
 	}
-	assertBoundButNotServing(t, managementAddr.String(), relayAddr.(*net.UDPAddr), config.RelayNetwork)
+	assertBoundButNotServing(t, operatorAddr.String(), relayAddr.(*net.UDPAddr), config.RelayNetwork)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	runDone := make(chan error, 1)
 	go func() { runDone <- server.Run(ctx) }()
-	waitForManagement(t, managementAddr.String(), serverTestToken)
+	waitForOperator(t, operatorAddr.String(), serverTestToken)
 
-	allocation := createRoom(t, managementAddr.String(), serverTestToken, "room", 2)
+	allocation := createRoom(t, operatorAddr.String(), serverTestToken, "room", 2)
 	actualPort := uint16(relayAddr.(*net.UDPAddr).Port)
 	if allocation.RelayEndpoint.Host != config.AdvertisedHost || allocation.RelayEndpoint.Port != actualPort {
 		t.Fatalf("advertised endpoint = %#v, want %s:%d", allocation.RelayEndpoint, config.AdvertisedHost, actualPort)
@@ -179,7 +179,7 @@ func TestRunSharesHTTPStoreWithRelayAndCancelsCleanly(t *testing.T) {
 	if err := server.Close(); err != nil {
 		t.Fatalf("Close() after Run: %v", err)
 	}
-	assertAddressesRebind(t, managementAddr, relayAddr, config.RelayNetwork)
+	assertAddressesRebind(t, operatorAddr, relayAddr, config.RelayNetwork)
 }
 
 func TestPlayerHTTPToUDPFlows(t *testing.T) {
@@ -196,13 +196,13 @@ func TestPlayerHTTPToUDPFlows(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New(): %v", err)
 			}
-			management, player, relayAddress := server.ManagementAddr().String(), server.PlayerAddr().String(), server.RelayAddr().(*net.UDPAddr).AddrPort()
+			operator, player, relayAddress := server.OperatorAddr().String(), server.PlayerAddr().String(), server.RelayAddr().(*net.UDPAddr).AddrPort()
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan error, 1)
 			go func() { done <- server.Run(ctx) }()
-			waitForManagement(t, management, serverTestToken)
-			firstToken := issuePlayerToken(t, management, "player-a")
-			secondToken := issuePlayerToken(t, management, "player-b")
+			waitForOperator(t, operator, serverTestToken)
+			firstToken := issuePlayerToken(t, operator, "player-a")
+			secondToken := issuePlayerToken(t, operator, "player-b")
 			firstAssignment, secondAssignment := flow.assign(t, player, firstToken, secondToken)
 			if firstAssignment.RoomID != secondAssignment.RoomID || firstAssignment.PlayerID != "player-a" || secondAssignment.PlayerID != "player-b" || firstAssignment.GrantSecret == secondAssignment.GrantSecret {
 				t.Fatalf("assignments = %+v / %+v", firstAssignment, secondAssignment)
@@ -223,7 +223,7 @@ func TestPlayerHTTPToUDPFlows(t *testing.T) {
 			if err := server.Close(); err != nil {
 				t.Fatalf("Close(): %v", err)
 			}
-			assertThreeAddressesRebind(t, server.ManagementAddr(), server.PlayerAddr(), server.RelayAddr(), config.RelayNetwork)
+			assertThreeAddressesRebind(t, server.OperatorAddr(), server.PlayerAddr(), server.RelayAddr(), config.RelayNetwork)
 		})
 	}
 }
@@ -242,9 +242,9 @@ func (assignment playerAssignment) grant() testGrantResponse {
 	return testGrantResponse{ParticipantID: assignment.PlayerID, SessionID: assignment.SessionID, GrantID: assignment.GrantID, GrantSecret: &secret}
 }
 
-func issuePlayerToken(t *testing.T, management, playerID string) string {
+func issuePlayerToken(t *testing.T, operator, playerID string) string {
 	t.Helper()
-	response := httpJSON(t, management, serverTestTokenBearer(), "POST", "/v1/player-tokens", `{"player_id":"`+playerID+`"}`)
+	response := httpJSON(t, operator, serverTestTokenBearer(), "POST", "/v1/player-tokens", `{"player_id":"`+playerID+`"}`)
 	if response.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(response.Body)
 		response.Body.Close()
@@ -343,9 +343,9 @@ func serverTestTokenBearer() string {
 	return "Bearer " + base64.RawURLEncoding.EncodeToString(serverTestToken[:])
 }
 
-func assertThreeAddressesRebind(t *testing.T, management, player, relayAddress net.Addr, relayNetwork string) {
+func assertThreeAddressesRebind(t *testing.T, operator, player, relayAddress net.Addr, relayNetwork string) {
 	t.Helper()
-	for _, address := range []net.Addr{management, player} {
+	for _, address := range []net.Addr{operator, player} {
 		listener, err := net.Listen("tcp", address.String())
 		if err != nil {
 			t.Fatalf("TCP %s not reusable: %v", address, err)
@@ -366,7 +366,7 @@ func TestCloseBeforeDuringAndAfterRunIsIdempotent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New(): %v", err)
 		}
-		managementAddr, relayAddr := server.ManagementAddr(), server.RelayAddr()
+		operatorAddr, relayAddr := server.OperatorAddr(), server.RelayAddr()
 		var wait sync.WaitGroup
 		for range 16 {
 			wait.Add(1)
@@ -384,7 +384,7 @@ func TestCloseBeforeDuringAndAfterRunIsIdempotent(t *testing.T) {
 		if server.runStarted {
 			t.Fatal("Run after pre-Close started owned work")
 		}
-		assertAddressesRebind(t, managementAddr, relayAddr, config.RelayNetwork)
+		assertAddressesRebind(t, operatorAddr, relayAddr, config.RelayNetwork)
 	})
 
 	t.Run("during and after Run", func(t *testing.T) {
@@ -393,10 +393,10 @@ func TestCloseBeforeDuringAndAfterRunIsIdempotent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New(): %v", err)
 		}
-		managementAddr, relayAddr := server.ManagementAddr(), server.RelayAddr()
+		operatorAddr, relayAddr := server.OperatorAddr(), server.RelayAddr()
 		runDone := make(chan error, 1)
 		go func() { runDone <- server.Run(context.Background()) }()
-		waitForManagement(t, managementAddr.String(), serverTestToken)
+		waitForOperator(t, operatorAddr.String(), serverTestToken)
 
 		var wait sync.WaitGroup
 		for range 16 {
@@ -420,7 +420,7 @@ func TestCloseBeforeDuringAndAfterRunIsIdempotent(t *testing.T) {
 		if err := server.Close(); err != nil {
 			t.Fatalf("Close() after join: %v", err)
 		}
-		assertAddressesRebind(t, managementAddr, relayAddr, config.RelayNetwork)
+		assertAddressesRebind(t, operatorAddr, relayAddr, config.RelayNetwork)
 	})
 }
 
@@ -430,12 +430,12 @@ func TestUnexpectedOwnedLoopFailureCancelsSiblings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(): %v", err)
 	}
-	managementAddr, relayAddr := server.ManagementAddr(), server.RelayAddr()
+	operatorAddr, relayAddr := server.OperatorAddr(), server.RelayAddr()
 	runDone := make(chan error, 1)
 	go func() { runDone <- server.Run(context.Background()) }()
-	waitForManagement(t, managementAddr.String(), serverTestToken)
+	waitForOperator(t, operatorAddr.String(), serverTestToken)
 
-	if err := server.managementListener.Close(); err != nil {
+	if err := server.operatorListener.Close(); err != nil {
 		t.Fatalf("close owned listener: %v", err)
 	}
 	select {
@@ -453,14 +453,14 @@ func TestUnexpectedOwnedLoopFailureCancelsSiblings(t *testing.T) {
 	if err := server.Close(); err != nil {
 		t.Fatalf("Close() after unexpected failure: %v", err)
 	}
-	assertAddressesRebind(t, managementAddr, relayAddr, config.RelayNetwork)
+	assertAddressesRebind(t, operatorAddr, relayAddr, config.RelayNetwork)
 }
 
 func TestQueuedUnexpectedLoopFailureWinsLaterCancellation(t *testing.T) {
 	server := &Server{closeSignal: make(chan struct{})}
 	runContext, cancel := context.WithCancel(context.Background())
 	results := make(chan loopResult, 4)
-	results <- server.classifyLoopResult(runContext, "management", errors.New("sensitive cause"))
+	results <- server.classifyLoopResult(runContext, "operator", errors.New("sensitive cause"))
 	cancel()
 	results <- server.classifyLoopResult(runContext, "relay", net.ErrClosed)
 	results <- server.classifyLoopResult(runContext, "sweeper", nil)
@@ -480,20 +480,20 @@ func TestHTTPFatalRandomStopsServerAndJoinsSiblings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWithDependencies(): %v", err)
 	}
-	managementAddr, relayAddr := server.ManagementAddr(), server.RelayAddr()
+	operatorAddr, relayAddr := server.OperatorAddr(), server.RelayAddr()
 	if server.runStarted {
 		t.Fatal("New started work before Run")
 	}
-	assertBoundButNotServing(t, managementAddr.String(), relayAddr.(*net.UDPAddr), config.RelayNetwork)
+	assertBoundButNotServing(t, operatorAddr.String(), relayAddr.(*net.UDPAddr), config.RelayNetwork)
 
 	runDone := make(chan error, 1)
 	go func() { runDone <- server.Run(context.Background()) }()
-	waitForManagement(t, managementAddr.String(), serverTestToken)
+	waitForOperator(t, operatorAddr.String(), serverTestToken)
 	now := time.Now().UTC()
 	body := []byte(`{"capacity":1,"expires_at":"` + now.Add(time.Hour).Format(time.RFC3339Nano) +
 		`","participants":[{"participant_id":"participant","session_id":"session","grant_expires_at":"` +
 		now.Add(30*time.Minute).Format(time.RFC3339Nano) + `"}]}`)
-	request, err := http.NewRequest(http.MethodPut, "http://"+managementAddr.String()+"/v1/rooms/room", bytes.NewReader(body))
+	request, err := http.NewRequest(http.MethodPut, "http://"+operatorAddr.String()+"/v1/rooms/room", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("NewRequest(): %v", err)
 	}
@@ -528,7 +528,7 @@ func TestHTTPFatalRandomStopsServerAndJoinsSiblings(t *testing.T) {
 	if err := server.Close(); err != nil {
 		t.Fatalf("Close() after HTTP fatal random: %v", err)
 	}
-	assertAddressesRebind(t, managementAddr, relayAddr, config.RelayNetwork)
+	assertAddressesRebind(t, operatorAddr, relayAddr, config.RelayNetwork)
 }
 
 type failingReader struct{}
@@ -537,37 +537,37 @@ func (failingReader) Read([]byte) (int, error) { return 0, errors.New("injected 
 
 func testServerConfig() Config {
 	return Config{
-		ManagementListen: "127.0.0.1:0",
-		PlayerListen:     "127.0.0.1:0",
-		RelayNetwork:     "udp4",
-		RelayListen:      "127.0.0.1:0",
-		AdvertisedHost:   "relay.test",
-		AdvertisedPort:   0,
-		OperatorToken:    serverTestToken,
+		OperatorListen: "127.0.0.1:0",
+		PlayerListen:   "127.0.0.1:0",
+		RelayNetwork:   "udp4",
+		RelayListen:    "127.0.0.1:0",
+		AdvertisedHost: "relay.test",
+		AdvertisedPort: 0,
+		OperatorToken:  serverTestToken,
 	}
 }
 
-func assertBoundButNotServing(t *testing.T, management string, relayAddress *net.UDPAddr, relayNetwork string) {
+func assertBoundButNotServing(t *testing.T, operator string, relayAddress *net.UDPAddr, relayNetwork string) {
 	t.Helper()
-	connection, err := net.DialTimeout("tcp", management, time.Second)
+	connection, err := net.DialTimeout("tcp", operator, time.Second)
 	if err != nil {
-		t.Fatalf("management listener was not bound: %v", err)
+		t.Fatalf("operator listener was not bound: %v", err)
 	}
-	if _, err := io.WriteString(connection, "GET /v1/rooms/missing HTTP/1.1\r\nHost: "+management+"\r\n\r\n"); err != nil {
+	if _, err := io.WriteString(connection, "GET /v1/rooms/missing HTTP/1.1\r\nHost: "+operator+"\r\n\r\n"); err != nil {
 		t.Fatalf("write pre-Run request: %v", err)
 	}
 	_ = connection.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 	var one [1]byte
 	if _, err := connection.Read(one[:]); err == nil {
-		t.Fatal("management served a response before Run")
+		t.Fatal("operator served a response before Run")
 	} else if networkError, ok := err.(net.Error); !ok || !networkError.Timeout() {
 		t.Fatalf("pre-Run read = %v, want timeout", err)
 	}
 	_ = connection.Close()
 
-	if listener, err := net.Listen("tcp", management); err == nil {
+	if listener, err := net.Listen("tcp", operator); err == nil {
 		_ = listener.Close()
-		t.Fatal("management address was not held after New")
+		t.Fatal("operator address was not held after New")
 	}
 	if socket, err := net.ListenUDP(relayNetwork, relayAddress); err == nil {
 		_ = socket.Close()
@@ -575,7 +575,7 @@ func assertBoundButNotServing(t *testing.T, management string, relayAddress *net
 	}
 }
 
-func waitForManagement(t *testing.T, address string, token [32]byte) {
+func waitForOperator(t *testing.T, address string, token [32]byte) {
 	t.Helper()
 	client := &http.Client{Timeout: 100 * time.Millisecond}
 	deadline := time.Now().Add(2 * time.Second)
@@ -594,7 +594,7 @@ func waitForManagement(t *testing.T, address string, token [32]byte) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatal("management listener did not start serving")
+	t.Fatal("operator listener did not start serving")
 }
 
 type testAllocationResponse struct {
@@ -824,13 +824,13 @@ func bytesTo32(t *testing.T, decoded []byte) (value protocol.Bytes32) {
 	return value
 }
 
-func assertAddressesRebind(t *testing.T, managementAddr, relayAddr net.Addr, relayNetwork string) {
+func assertAddressesRebind(t *testing.T, operatorAddr, relayAddr net.Addr, relayNetwork string) {
 	t.Helper()
-	management, err := net.Listen("tcp", managementAddr.String())
+	operator, err := net.Listen("tcp", operatorAddr.String())
 	if err != nil {
-		t.Fatalf("rebind management %s: %v", managementAddr, err)
+		t.Fatalf("rebind operator %s: %v", operatorAddr, err)
 	}
-	_ = management.Close()
+	_ = operator.Close()
 	relay, err := net.ListenUDP(relayNetwork, relayAddr.(*net.UDPAddr))
 	if err != nil {
 		t.Fatalf("rebind relay %s: %v", relayAddr, err)

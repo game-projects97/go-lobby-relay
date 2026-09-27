@@ -40,13 +40,13 @@ type Claims struct {
 	ExpiresAt time.Time
 }
 
-type Auth struct {
+type Issuer struct {
 	key      [32]byte
 	now      func() time.Time
 	tokenTTL time.Duration
 }
 
-func New(config Config) (*Auth, error) {
+func New(config Config) (*Issuer, error) {
 	if config.OperatorSecret == ([32]byte{}) || config.TokenTTL <= 0 || config.TokenTTL > HardTokenTTL {
 		return nil, ErrInvalid
 	}
@@ -68,10 +68,10 @@ func New(config Config) (*Auth, error) {
 	_, _ = mac.Write(nonce[:])
 	var key [32]byte
 	copy(key[:], mac.Sum(nil))
-	return &Auth{key: key, now: now, tokenTTL: config.TokenTTL}, nil
+	return &Issuer{key: key, now: now, tokenTTL: config.TokenTTL}, nil
 }
 
-func (auth *Auth) Issue(playerID string) (string, Claims, error) {
+func (auth *Issuer) Issue(playerID string) (string, Claims, error) {
 	if auth == nil || !protocol.ValidID(playerID) {
 		return "", Claims{}, ErrInvalid
 	}
@@ -92,7 +92,7 @@ func (auth *Auth) Issue(playerID string) (string, Claims, error) {
 	return base64.RawURLEncoding.EncodeToString(raw), Claims{PlayerID: playerID, ExpiresAt: expiresAt}, nil
 }
 
-func (auth *Auth) Verify(token string) (Claims, error) {
+func (auth *Issuer) Verify(token string) (Claims, error) {
 	if auth == nil {
 		return Claims{}, ErrInvalid
 	}
