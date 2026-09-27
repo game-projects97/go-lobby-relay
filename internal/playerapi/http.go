@@ -1,18 +1,14 @@
 package playerapi
 
 import (
-	"bytes"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"io"
-	"mime"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/gyungsubLee/go-lobby-relay/internal/httpapi/httpx"
 	"github.com/gyungsubLee/go-lobby-relay/internal/lobby"
 	"github.com/gyungsubLee/go-lobby-relay/internal/playerauth"
 	"golang.org/x/time/rate"
@@ -22,7 +18,6 @@ const (
 	HardPlayerRequestRate  = rate.Limit(100)
 	HardPlayerRequestBurst = 200
 	HardPlayerConcurrent   = 64
-	maxBodyBytes           = 64 << 10
 )
 
 var errInvalidConfig = errors.New("invalid player API config")
@@ -44,9 +39,7 @@ type handler struct {
 	lobbies        *lobby.Manager
 	advertisedHost string
 	advertisedPort uint16
-	limiter        *rate.Limiter
-	semaphore      chan struct{}
-	now            func() time.Time
+	admission      *httpx.Admission
 	fatal          func()
 }
 
@@ -57,21 +50,16 @@ func NewHandler(config Config) (http.Handler, error) {
 		config.MaxConcurrent <= 0 || config.MaxConcurrent > HardPlayerConcurrent {
 		return nil, errInvalidConfig
 	}
-	now := config.Now
-	if now == nil {
-		now = time.Now
-	}
 	return &handler{
 		playerTokens: config.PlayerTokens, lobbies: config.Lobbies,
 		advertisedHost: config.AdvertisedHost, advertisedPort: config.AdvertisedPort,
-		limiter:   rate.NewLimiter(config.RequestRate, config.RequestBurst),
-		semaphore: make(chan struct{}, config.MaxConcurrent), now: now, fatal: config.Fatal,
+		admission: httpx.NewAdmission(config.RequestRate, config.RequestBurst, config.MaxConcurrent, config.Now),
+		fatal:     config.Fatal,
 	}, nil
 }
 
 func NewServer(addr string, handler http.Handler) *http.Server {
-	return &http.Server{Addr: addr, Handler: handler, DisableGeneralOptionsHandler: true, MaxHeaderBytes: 16 << 10,
-		ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	return httpx.NewServer(addr, handler)
 }
 
 func (handler *handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -79,20 +67,14 @@ func (handler *handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	claims, ok := handler.authorize(request)
 	if !ok {
 		writer.Header().Set("WWW-Authenticate", "Bearer")
-		writeError(writer, http.StatusUnauthorized, "unauthorized", "valid player bearer token required")
+		httpx.WriteError(writer, http.StatusUnauthorized, "unauthorized", "valid player bearer token required")
 		return
 	}
-	if !handler.limiter.AllowN(handler.now(), 1) {
-		writeError(writer, http.StatusTooManyRequests, "rate_limited", "request rate or concurrency limit exceeded")
+	release, admitted := handler.admission.Enter(writer)
+	if !admitted {
 		return
 	}
-	select {
-	case handler.semaphore <- struct{}{}:
-		defer func() { <-handler.semaphore }()
-	default:
-		writeError(writer, http.StatusTooManyRequests, "rate_limited", "request rate or concurrency limit exceeded")
-		return
-	}
+	defer release()
 	handler.route(writer, request, claims.PlayerID)
 }
 
@@ -111,7 +93,7 @@ func (handler *handler) authorize(request *http.Request) (playerauth.Claims, boo
 
 func (handler *handler) route(writer http.ResponseWriter, request *http.Request, playerID string) {
 	if request.URL.EscapedPath() != request.URL.Path {
-		writeError(writer, http.StatusNotFound, "not_found", "resource not found")
+		httpx.WriteError(writer, http.StatusNotFound, "not_found", "resource not found")
 		return
 	}
 	switch request.URL.Path {
@@ -127,13 +109,13 @@ func (handler *handler) route(writer http.ResponseWriter, request *http.Request,
 	}
 	const prefix = "/v1/lobbies/"
 	if !strings.HasPrefix(request.URL.Path, prefix) {
-		writeError(writer, http.StatusNotFound, "not_found", "resource not found")
+		httpx.WriteError(writer, http.StatusNotFound, "not_found", "resource not found")
 		return
 	}
 	tail := strings.TrimPrefix(request.URL.Path, prefix)
 	parts := strings.Split(tail, "/")
 	if len(parts) < 1 || parts[0] == "" {
-		writeError(writer, http.StatusNotFound, "not_found", "resource not found")
+		httpx.WriteError(writer, http.StatusNotFound, "not_found", "resource not found")
 		return
 	}
 	lobbyID := parts[0]
@@ -149,15 +131,15 @@ func (handler *handler) route(writer http.ResponseWriter, request *http.Request,
 	case len(parts) == 4 && parts[1] == "members" && parts[2] == "me" && parts[3] == "ready":
 		handler.readyRoute(writer, request, playerID, lobbyID)
 	default:
-		writeError(writer, http.StatusNotFound, "not_found", "resource not found")
+		httpx.WriteError(writer, http.StatusNotFound, "not_found", "resource not found")
 	}
 }
 
 func (handler *handler) lobbiesRoute(writer http.ResponseWriter, request *http.Request, playerID string) {
 	switch request.Method {
 	case http.MethodPost:
-		if !noQuery(request.URL.Query()) {
-			invalid(writer)
+		if len(request.URL.Query()) != 0 {
+			httpx.WriteInvalid(writer)
 			return
 		}
 		var body struct {
@@ -165,38 +147,38 @@ func (handler *handler) lobbiesRoute(writer http.ResponseWriter, request *http.R
 			QueueKey   string           `json:"queue_key"`
 			Capacity   uint32           `json:"capacity"`
 		}
-		if !decodeExact(writer, request, &body, "visibility", "queue_key", "capacity") {
+		if !httpx.DecodeExact(writer, request, &body, "visibility", "queue_key", "capacity") {
 			return
 		}
 		result, err := handler.lobbies.Create(playerID, lobby.CreateRequest{Visibility: body.Visibility, QueueKey: body.QueueKey, Capacity: body.Capacity})
 		handler.writeResult(writer, http.StatusCreated, encodeLobby(result, handler.advertisedHost, handler.advertisedPort), err)
 	case http.MethodGet:
-		if requestHasBody(request) {
-			invalid(writer)
+		if httpx.RequestHasBody(request) {
+			httpx.WriteInvalid(writer)
 			return
 		}
 		query := request.URL.Query()
-		if !exactQuery(query, "queue_key", "cursor", "limit") || len(query["queue_key"]) != 1 {
-			invalid(writer)
+		if !httpx.HasOnlyQueryKeys(query, "queue_key", "cursor", "limit") || len(query["queue_key"]) != 1 {
+			httpx.WriteInvalid(writer)
 			return
 		}
 		limit := 20
 		var err error
 		if values, exists := query["limit"]; exists {
 			if len(values) != 1 {
-				invalid(writer)
+				httpx.WriteInvalid(writer)
 				return
 			}
 			limit, err = strconv.Atoi(values[0])
 			if err != nil {
-				invalid(writer)
+				httpx.WriteInvalid(writer)
 				return
 			}
 		}
 		cursor := ""
 		if values, exists := query["cursor"]; exists {
 			if len(values) != 1 {
-				invalid(writer)
+				httpx.WriteInvalid(writer)
 				return
 			}
 			cursor = values[0]
@@ -204,17 +186,17 @@ func (handler *handler) lobbiesRoute(writer http.ResponseWriter, request *http.R
 		page, listErr := handler.lobbies.List(query.Get("queue_key"), cursor, limit)
 		handler.writeResult(writer, http.StatusOK, pageResponse(page), listErr)
 	default:
-		methodNotAllowed(writer, "POST, GET")
+		httpx.WriteMethodNotAllowed(writer, "POST, GET")
 	}
 }
 
 func (handler *handler) oneLobbyRoute(writer http.ResponseWriter, request *http.Request, playerID, lobbyID string) {
 	if request.Method != http.MethodGet {
-		methodNotAllowed(writer, "GET")
+		httpx.WriteMethodNotAllowed(writer, "GET")
 		return
 	}
-	if requestHasBody(request) || !noQuery(request.URL.Query()) {
-		invalid(writer)
+	if httpx.RequestHasBody(request) || len(request.URL.Query()) != 0 {
+		httpx.WriteInvalid(writer)
 		return
 	}
 	result, err := handler.lobbies.Get(playerID, lobbyID)
@@ -223,17 +205,17 @@ func (handler *handler) oneLobbyRoute(writer http.ResponseWriter, request *http.
 
 func (handler *handler) revisionRoute(writer http.ResponseWriter, request *http.Request, method string, action func(uint64) (any, error)) {
 	if request.Method != method {
-		methodNotAllowed(writer, method)
+		httpx.WriteMethodNotAllowed(writer, method)
 		return
 	}
-	if !noQuery(request.URL.Query()) {
-		invalid(writer)
+	if len(request.URL.Query()) != 0 {
+		httpx.WriteInvalid(writer)
 		return
 	}
 	var body struct {
 		Revision uint64 `json:"revision"`
 	}
-	if !decodeExact(writer, request, &body, "revision") {
+	if !httpx.DecodeExact(writer, request, &body, "revision") {
 		return
 	}
 	result, err := action(body.Revision)
@@ -242,18 +224,18 @@ func (handler *handler) revisionRoute(writer http.ResponseWriter, request *http.
 
 func (handler *handler) readyRoute(writer http.ResponseWriter, request *http.Request, playerID, lobbyID string) {
 	if request.Method != http.MethodPut {
-		methodNotAllowed(writer, "PUT")
+		httpx.WriteMethodNotAllowed(writer, "PUT")
 		return
 	}
-	if !noQuery(request.URL.Query()) {
-		invalid(writer)
+	if len(request.URL.Query()) != 0 {
+		httpx.WriteInvalid(writer)
 		return
 	}
 	var body struct {
 		Revision uint64 `json:"revision"`
 		Ready    bool   `json:"ready"`
 	}
-	if !decodeExact(writer, request, &body, "revision", "ready") {
+	if !httpx.DecodeExact(writer, request, &body, "revision", "ready") {
 		return
 	}
 	result, err := handler.lobbies.SetReady(playerID, lobbyID, body.Revision, body.Ready)
@@ -262,18 +244,18 @@ func (handler *handler) readyRoute(writer http.ResponseWriter, request *http.Req
 
 func (handler *handler) ticketsRoute(writer http.ResponseWriter, request *http.Request, playerID string) {
 	if request.Method != http.MethodPost {
-		methodNotAllowed(writer, "POST")
+		httpx.WriteMethodNotAllowed(writer, "POST")
 		return
 	}
-	if !noQuery(request.URL.Query()) {
-		invalid(writer)
+	if len(request.URL.Query()) != 0 {
+		httpx.WriteInvalid(writer)
 		return
 	}
 	var body struct {
 		QueueKey string `json:"queue_key"`
 		Capacity uint32 `json:"capacity"`
 	}
-	if !decodeExact(writer, request, &body, "queue_key", "capacity") {
+	if !httpx.DecodeExact(writer, request, &body, "queue_key", "capacity") {
 		return
 	}
 	result, err := handler.lobbies.Enqueue(playerID, lobby.EnqueueRequest{QueueKey: body.QueueKey, Capacity: body.Capacity})
@@ -283,27 +265,27 @@ func (handler *handler) ticketsRoute(writer http.ResponseWriter, request *http.R
 func (handler *handler) myTicketRoute(writer http.ResponseWriter, request *http.Request, playerID string) {
 	switch request.Method {
 	case http.MethodGet:
-		if requestHasBody(request) || !noQuery(request.URL.Query()) {
-			invalid(writer)
+		if httpx.RequestHasBody(request) || len(request.URL.Query()) != 0 {
+			httpx.WriteInvalid(writer)
 			return
 		}
 		result, err := handler.lobbies.GetTicket(playerID)
 		handler.writeResult(writer, http.StatusOK, encodeTicket(result, handler.advertisedHost, handler.advertisedPort), err)
 	case http.MethodDelete:
-		if !noQuery(request.URL.Query()) {
-			invalid(writer)
+		if len(request.URL.Query()) != 0 {
+			httpx.WriteInvalid(writer)
 			return
 		}
 		var body struct {
 			Revision uint64 `json:"revision"`
 		}
-		if !decodeExact(writer, request, &body, "revision") {
+		if !httpx.DecodeExact(writer, request, &body, "revision") {
 			return
 		}
 		result, err := handler.lobbies.CancelTicket(playerID, body.Revision)
 		handler.writeResult(writer, http.StatusOK, encodeTicket(result, handler.advertisedHost, handler.advertisedPort), err)
 	default:
-		methodNotAllowed(writer, "GET, DELETE")
+		httpx.WriteMethodNotAllowed(writer, "GET, DELETE")
 	}
 }
 
@@ -320,29 +302,26 @@ func (handler *handler) response(value any) any {
 
 func (handler *handler) writeResult(writer http.ResponseWriter, status int, value any, err error) {
 	if err == nil {
-		writeJSON(writer, status, value)
+		httpx.WriteJSON(writer, status, value)
 		return
 	}
 	switch {
 	case errors.Is(err, lobby.ErrInvalid):
-		invalid(writer)
+		httpx.WriteInvalid(writer)
 	case errors.Is(err, lobby.ErrNotFound):
-		writeError(writer, http.StatusNotFound, "not_found", "resource not found")
+		httpx.WriteError(writer, http.StatusNotFound, "not_found", "resource not found")
 	case errors.Is(err, lobby.ErrConflict):
-		writeError(writer, http.StatusConflict, "conflict", "state or revision conflict")
+		httpx.WriteError(writer, http.StatusConflict, "conflict", "state or revision conflict")
 	case errors.Is(err, lobby.ErrForbidden):
-		writeError(writer, http.StatusForbidden, "forbidden", "operation is not allowed")
+		httpx.WriteError(writer, http.StatusForbidden, "forbidden", "operation is not allowed")
 	case errors.Is(err, lobby.ErrCapacity):
-		writeError(writer, http.StatusConflict, "capacity", "capacity limit exceeded")
+		httpx.WriteError(writer, http.StatusConflict, "capacity", "capacity limit exceeded")
 	case errors.Is(err, lobby.ErrUnavailable):
-		writeError(writer, http.StatusServiceUnavailable, "unavailable", "service temporarily unavailable")
+		httpx.WriteError(writer, http.StatusServiceUnavailable, "unavailable", "service temporarily unavailable")
 	default:
-		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
-		if errors.Is(err, lobby.ErrFatalRandom) && handler.fatal != nil {
-			if flusher, ok := writer.(http.Flusher); ok {
-				flusher.Flush()
-			}
-			handler.fatal()
+		httpx.WriteError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
+		if errors.Is(err, lobby.ErrFatalRandom) {
+			httpx.NotifyFatal(writer, handler.fatal)
 		}
 	}
 }
@@ -435,141 +414,4 @@ func pageResponse(value lobby.LobbyPage) any {
 		Lobbies    []summaryJSON `json:"lobbies"`
 		NextCursor string        `json:"next_cursor"`
 	}{lobbies, value.NextCursor}
-}
-
-func decodeExact(writer http.ResponseWriter, request *http.Request, target any, keys ...string) bool {
-	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		writeError(writer, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
-		return false
-	}
-	request.Body = http.MaxBytesReader(writer, request.Body, maxBodyBytes)
-	body, err := io.ReadAll(request.Body)
-	if err != nil {
-		if _, ok := err.(*http.MaxBytesError); ok {
-			writeError(writer, http.StatusRequestEntityTooLarge, "body_too_large", "request body exceeds 65536 bytes")
-		} else {
-			invalid(writer)
-		}
-		return false
-	}
-	var object map[string]json.RawMessage
-	if !uniqueJSON(body) || json.Unmarshal(body, &object) != nil || !exactKeys(object, keys...) {
-		invalid(writer)
-		return false
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(target) != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		invalid(writer)
-		return false
-	}
-	return true
-}
-func uniqueJSON(body []byte) bool {
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.UseNumber()
-	if !scanValue(decoder) {
-		return false
-	}
-	_, err := decoder.Token()
-	return err == io.EOF
-}
-func scanValue(decoder *json.Decoder) bool {
-	token, err := decoder.Token()
-	if err != nil {
-		return false
-	}
-	delimiter, ok := token.(json.Delim)
-	if !ok {
-		return true
-	}
-	switch delimiter {
-	case '{':
-		seen := map[string]struct{}{}
-		for decoder.More() {
-			token, err := decoder.Token()
-			key, ok := token.(string)
-			if err != nil || !ok {
-				return false
-			}
-			if _, exists := seen[key]; exists {
-				return false
-			}
-			seen[key] = struct{}{}
-			if !scanValue(decoder) {
-				return false
-			}
-		}
-		end, err := decoder.Token()
-		return err == nil && end == json.Delim('}')
-	case '[':
-		for decoder.More() {
-			if !scanValue(decoder) {
-				return false
-			}
-		}
-		end, err := decoder.Token()
-		return err == nil && end == json.Delim(']')
-	}
-	return false
-}
-func exactKeys(object map[string]json.RawMessage, keys ...string) bool {
-	if len(object) != len(keys) {
-		return false
-	}
-	for _, key := range keys {
-		if _, ok := object[key]; !ok {
-			return false
-		}
-	}
-	return true
-}
-func exactQuery(query url.Values, allowed ...string) bool {
-	allowedSet := map[string]bool{}
-	for _, key := range allowed {
-		allowedSet[key] = true
-	}
-	for key, values := range query {
-		if !allowedSet[key] || len(values) != 1 {
-			return false
-		}
-	}
-	return true
-}
-func noQuery(query url.Values) bool { return len(query) == 0 }
-func requestHasBody(request *http.Request) bool {
-	if request.Body == nil || request.ContentLength == 0 {
-		return false
-	}
-	if request.ContentLength > 0 {
-		return true
-	}
-	var one [1]byte
-	read, err := request.Body.Read(one[:])
-	return read != 0 || err != io.EOF
-}
-func invalid(writer http.ResponseWriter) {
-	writeError(writer, http.StatusBadRequest, "invalid_request", "request is invalid")
-}
-func methodNotAllowed(writer http.ResponseWriter, allow string) {
-	writer.Header().Set("Allow", allow)
-	writeError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
-}
-func writeError(writer http.ResponseWriter, status int, code, message string) {
-	writeJSON(writer, status, struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}{Error: struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	}{code, message}})
-}
-func writeJSON(writer http.ResponseWriter, status int, value any) {
-	encoded, _ := json.Marshal(value)
-	writer.Header().Set("Content-Type", "application/json")
-	writer.WriteHeader(status)
-	_, _ = writer.Write(append(encoded, '\n'))
 }

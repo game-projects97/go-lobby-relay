@@ -1,17 +1,15 @@
 package control
 
 import (
-	"bytes"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"io"
-	"mime"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/gyungsubLee/go-lobby-relay/internal/httpapi/httpx"
 	"github.com/gyungsubLee/go-lobby-relay/internal/playerauth"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
 	"github.com/gyungsubLee/go-lobby-relay/internal/store"
@@ -22,8 +20,6 @@ const (
 	HardManagementRequestRate  = rate.Limit(20)
 	HardManagementRequestBurst = 40
 	HardManagementConcurrent   = 32
-
-	maxRequestBodyBytes = 64 << 10
 )
 
 var errInvalidConfig = errors.New("invalid control config")
@@ -48,9 +44,7 @@ type handler struct {
 	advertisedPort uint16
 	rooms          *store.Store
 	playerTokens   *playerauth.Auth
-	limiter        *rate.Limiter
-	semaphore      chan struct{}
-	now            func() time.Time
+	admission      *httpx.Admission
 	fatal          func()
 }
 
@@ -61,34 +55,19 @@ func NewHandler(config Config, rooms *store.Store) (http.Handler, error) {
 		config.MaxConcurrent <= 0 || config.MaxConcurrent > HardManagementConcurrent {
 		return nil, errInvalidConfig
 	}
-	now := config.Now
-	if now == nil {
-		now = time.Now
-	}
 	return &handler{
 		operatorToken:  config.OperatorToken,
 		advertisedHost: config.AdvertisedHost,
 		advertisedPort: config.AdvertisedPort,
 		rooms:          rooms,
 		playerTokens:   config.PlayerTokens,
-		limiter:        rate.NewLimiter(config.RequestRate, config.RequestBurst),
-		semaphore:      make(chan struct{}, config.MaxConcurrent),
-		now:            now,
+		admission:      httpx.NewAdmission(config.RequestRate, config.RequestBurst, config.MaxConcurrent, config.Now),
 		fatal:          config.Fatal,
 	}, nil
 }
 
 func NewServer(addr string, handler http.Handler) *http.Server {
-	return &http.Server{
-		Addr:                         addr,
-		Handler:                      handler,
-		DisableGeneralOptionsHandler: true,
-		MaxHeaderBytes:               16 << 10,
-		ReadHeaderTimeout:            2 * time.Second,
-		ReadTimeout:                  5 * time.Second,
-		WriteTimeout:                 5 * time.Second,
-		IdleTimeout:                  30 * time.Second,
-	}
+	return httpx.NewServer(addr, handler)
 }
 
 func ParseOperatorToken(encoded string) ([32]byte, error) {
@@ -112,39 +91,31 @@ func (handler *handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	roomID, roomRoute := canonicalRoomPath(request)
 	tokenRoute := request.URL.EscapedPath() == request.URL.Path && request.URL.Path == "/v1/player-tokens"
 	if !roomRoute && !tokenRoute {
-		writeError(writer, http.StatusNotFound, "not_found", "room not found")
+		httpx.WriteError(writer, http.StatusNotFound, "not_found", "room not found")
 		return
 	}
 	if !authorized(request, handler.operatorToken) {
 		writer.Header().Set("WWW-Authenticate", "Bearer")
-		writeError(writer, http.StatusUnauthorized, "unauthorized", "valid bearer token required")
+		httpx.WriteError(writer, http.StatusUnauthorized, "unauthorized", "valid bearer token required")
 		return
 	}
 	if roomRoute && !protocol.ValidID(roomID) {
-		writeError(writer, http.StatusBadRequest, "invalid_request", "request is invalid")
+		httpx.WriteInvalid(writer)
 		return
 	}
 	if tokenRoute && request.Method != http.MethodPost {
-		writer.Header().Set("Allow", "POST")
-		writeError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		httpx.WriteMethodNotAllowed(writer, "POST")
 		return
 	}
 	if roomRoute && request.Method != http.MethodPut && request.Method != http.MethodGet && request.Method != http.MethodDelete {
-		writer.Header().Set("Allow", "PUT, GET, DELETE")
-		writeError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		httpx.WriteMethodNotAllowed(writer, "PUT, GET, DELETE")
 		return
 	}
-	if !handler.limiter.AllowN(handler.now(), 1) {
-		writeError(writer, http.StatusTooManyRequests, "rate_limited", "request rate or concurrency limit exceeded")
+	release, admitted := handler.admission.Enter(writer)
+	if !admitted {
 		return
 	}
-	select {
-	case handler.semaphore <- struct{}{}:
-		defer func() { <-handler.semaphore }()
-	default:
-		writeError(writer, http.StatusTooManyRequests, "rate_limited", "request rate or concurrency limit exceeded")
-		return
-	}
+	defer release()
 	if tokenRoute {
 		handler.postPlayerToken(writer, request)
 		return
@@ -154,14 +125,14 @@ func (handler *handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	case http.MethodPut:
 		handler.putRoom(writer, request, roomID)
 	case http.MethodGet:
-		if requestHasBody(request) {
-			writeError(writer, http.StatusBadRequest, "invalid_request", "request is invalid")
+		if httpx.RequestHasBody(request) {
+			httpx.WriteInvalid(writer)
 			return
 		}
 		handler.getRoom(writer, roomID)
 	case http.MethodDelete:
-		if requestHasBody(request) {
-			writeError(writer, http.StatusBadRequest, "invalid_request", "request is invalid")
+		if httpx.RequestHasBody(request) {
+			httpx.WriteInvalid(writer)
 			return
 		}
 		handler.deleteRoom(writer, roomID)
@@ -172,60 +143,26 @@ func (handler *handler) postPlayerToken(writer http.ResponseWriter, request *htt
 	var body struct {
 		PlayerID string `json:"player_id"`
 	}
-	if !decodeExactJSON(writer, request, &body, "player_id") {
+	if !httpx.DecodeExact(writer, request, &body, "player_id") {
 		return
 	}
 	if !protocol.ValidID(body.PlayerID) {
-		writeError(writer, http.StatusBadRequest, "invalid_request", "request is invalid")
+		httpx.WriteInvalid(writer)
 		return
 	}
 	token, claims, err := handler.playerTokens.Issue(body.PlayerID)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
-		if errors.Is(err, playerauth.ErrFatalRandom) && handler.fatal != nil {
-			if flusher, ok := writer.(http.Flusher); ok {
-				flusher.Flush()
-			}
-			handler.fatal()
+		httpx.WriteError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
+		if errors.Is(err, playerauth.ErrFatalRandom) {
+			httpx.NotifyFatal(writer, handler.fatal)
 		}
 		return
 	}
-	writeJSON(writer, http.StatusCreated, struct {
+	httpx.WriteJSON(writer, http.StatusCreated, struct {
 		PlayerID  string `json:"player_id"`
 		Token     string `json:"token"`
 		ExpiresAt string `json:"expires_at"`
 	}{body.PlayerID, token, claims.ExpiresAt.UTC().Format(time.RFC3339Nano)})
-}
-
-func decodeExactJSON(writer http.ResponseWriter, request *http.Request, target any, keys ...string) bool {
-	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		writeError(writer, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
-		return false
-	}
-	request.Body = http.MaxBytesReader(writer, request.Body, maxRequestBodyBytes)
-	body, err := io.ReadAll(request.Body)
-	if err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			writeError(writer, http.StatusRequestEntityTooLarge, "body_too_large", "request body exceeds 65536 bytes")
-		} else {
-			writeError(writer, http.StatusBadRequest, "invalid_request", "request is invalid")
-		}
-		return false
-	}
-	var object map[string]json.RawMessage
-	if !hasUniqueJSONFields(body) || json.Unmarshal(body, &object) != nil || !hasExactKeys(object, keys...) {
-		writeError(writer, http.StatusBadRequest, "invalid_request", "request is invalid")
-		return false
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(target) != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		writeError(writer, http.StatusBadRequest, "invalid_request", "request is invalid")
-		return false
-	}
-	return true
 }
 
 func canonicalRoomPath(request *http.Request) (string, bool) {
@@ -254,48 +191,21 @@ func authorized(request *http.Request, expected [32]byte) bool {
 	return valid&equal == 1
 }
 
-func requestHasBody(request *http.Request) bool {
-	if request.Body == nil || request.ContentLength == 0 {
-		return false
-	}
-	if request.ContentLength > 0 {
-		return true
-	}
-	var oneByte [1]byte
-	read, err := request.Body.Read(oneByte[:])
-	return read != 0 || err != io.EOF
-}
-
 func (handler *handler) putRoom(writer http.ResponseWriter, request *http.Request, roomID string) {
-	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		writeError(writer, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
-		return
-	}
-	request.Body = http.MaxBytesReader(writer, request.Body, maxRequestBodyBytes)
-	body, err := io.ReadAll(request.Body)
-	if err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			writeError(writer, http.StatusRequestEntityTooLarge, "body_too_large", "request body exceeds 65536 bytes")
-			return
-		}
-		writeError(writer, http.StatusBadRequest, "invalid_request", "request is invalid")
+	body, ok := httpx.ReadJSONBody(writer, request)
+	if !ok {
 		return
 	}
 	definition, ok := decodeRoomDefinition(body)
 	if !ok {
-		writeError(writer, http.StatusBadRequest, "invalid_request", "request is invalid")
+		httpx.WriteInvalid(writer)
 		return
 	}
 	allocation, created, err := handler.rooms.CreateRoom(roomID, definition)
 	if err != nil {
 		writeStoreError(writer, err)
-		if errors.Is(err, store.ErrFatalRandom) && handler.fatal != nil {
-			if flusher, ok := writer.(http.Flusher); ok {
-				flusher.Flush()
-			}
-			handler.fatal()
+		if errors.Is(err, store.ErrFatalRandom) {
+			httpx.NotifyFatal(writer, handler.fatal)
 		}
 		return
 	}
@@ -303,7 +213,7 @@ func (handler *handler) putRoom(writer http.ResponseWriter, request *http.Reques
 	if created {
 		status = http.StatusCreated
 	}
-	writeJSON(writer, status, allocationResponse(allocation, handler.advertisedHost, handler.advertisedPort))
+	httpx.WriteJSON(writer, status, allocationResponse(allocation, handler.advertisedHost, handler.advertisedPort))
 }
 
 func (handler *handler) getRoom(writer http.ResponseWriter, roomID string) {
@@ -312,7 +222,7 @@ func (handler *handler) getRoom(writer http.ResponseWriter, roomID string) {
 		writeStoreError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, snapshotResponse(snapshot, handler.advertisedHost, handler.advertisedPort))
+	httpx.WriteJSON(writer, http.StatusOK, snapshotResponse(snapshot, handler.advertisedHost, handler.advertisedPort))
 }
 
 func (handler *handler) deleteRoom(writer http.ResponseWriter, roomID string) {
@@ -334,16 +244,11 @@ type createRoomRequest struct {
 }
 
 func decodeRoomDefinition(body []byte) (store.RoomDefinition, bool) {
-	if !hasUniqueJSONFields(body) || !hasExactRoomRequestFields(body) {
+	if !httpx.HasUniqueFields(body) || !hasExactRoomRequestFields(body) {
 		return store.RoomDefinition{}, false
 	}
 	var request createRoomRequest
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
-		return store.RoomDefinition{}, false
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+	if !httpx.DecodeStrict(body, &request) {
 		return store.RoomDefinition{}, false
 	}
 	expiresAt, ok := canonicalUTCTime(request.ExpiresAt)
@@ -371,7 +276,7 @@ func decodeRoomDefinition(body []byte) (store.RoomDefinition, bool) {
 
 func hasExactRoomRequestFields(body []byte) bool {
 	var request map[string]json.RawMessage
-	if json.Unmarshal(body, &request) != nil || !hasExactKeys(request, "capacity", "expires_at", "participants") {
+	if json.Unmarshal(body, &request) != nil || !httpx.HasExactKeys(request, "capacity", "expires_at", "participants") {
 		return false
 	}
 	var participants []map[string]json.RawMessage
@@ -379,19 +284,7 @@ func hasExactRoomRequestFields(body []byte) bool {
 		return false
 	}
 	for _, participant := range participants {
-		if !hasExactKeys(participant, "participant_id", "session_id", "grant_expires_at") {
-			return false
-		}
-	}
-	return true
-}
-
-func hasExactKeys(object map[string]json.RawMessage, keys ...string) bool {
-	if len(object) != len(keys) {
-		return false
-	}
-	for _, key := range keys {
-		if _, ok := object[key]; !ok {
+		if !httpx.HasExactKeys(participant, "participant_id", "session_id", "grant_expires_at") {
 			return false
 		}
 	}
@@ -404,57 +297,6 @@ func canonicalUTCTime(value string) (time.Time, bool) {
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, value)
 	return parsed, err == nil && parsed.UTC().Format(time.RFC3339Nano) == value
-}
-
-func hasUniqueJSONFields(body []byte) bool {
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.UseNumber()
-	if !scanJSONValue(decoder) {
-		return false
-	}
-	_, err := decoder.Token()
-	return err == io.EOF
-}
-
-func scanJSONValue(decoder *json.Decoder) bool {
-	token, err := decoder.Token()
-	if err != nil {
-		return false
-	}
-	delimiter, ok := token.(json.Delim)
-	if !ok {
-		return true
-	}
-	switch delimiter {
-	case '{':
-		seen := make(map[string]struct{})
-		for decoder.More() {
-			keyToken, err := decoder.Token()
-			key, keyOK := keyToken.(string)
-			if err != nil || !keyOK {
-				return false
-			}
-			if _, exists := seen[key]; exists {
-				return false
-			}
-			seen[key] = struct{}{}
-			if !scanJSONValue(decoder) {
-				return false
-			}
-		}
-		end, err := decoder.Token()
-		return err == nil && end == json.Delim('}')
-	case '[':
-		for decoder.More() {
-			if !scanJSONValue(decoder) {
-				return false
-			}
-		}
-		end, err := decoder.Token()
-		return err == nil && end == json.Delim(']')
-	default:
-		return false
-	}
 }
 
 type relayEndpointResponse struct {
@@ -554,38 +396,17 @@ func commonResponse(roomID string, createdAt, expiresAt time.Time, capacity uint
 	}
 }
 
-type errorResponse struct {
-	Error struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
 func writeStoreError(writer http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrInvalid):
-		writeError(writer, http.StatusBadRequest, "invalid_request", "request is invalid")
+		httpx.WriteInvalid(writer)
 	case errors.Is(err, store.ErrNotFound):
-		writeError(writer, http.StatusNotFound, "not_found", "room not found")
+		httpx.WriteError(writer, http.StatusNotFound, "not_found", "room not found")
 	case errors.Is(err, store.ErrConflict):
-		writeError(writer, http.StatusConflict, "conflict", "room_id already exists with a different immutable definition")
+		httpx.WriteError(writer, http.StatusConflict, "conflict", "room_id already exists with a different immutable definition")
 	case errors.Is(err, store.ErrCapacity):
-		writeError(writer, http.StatusUnprocessableEntity, "capacity_exceeded", "capacity limit exceeded")
+		httpx.WriteError(writer, http.StatusUnprocessableEntity, "capacity_exceeded", "capacity limit exceeded")
 	default:
-		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
+		httpx.WriteError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
 	}
-}
-
-func writeError(writer http.ResponseWriter, status int, code, message string) {
-	response := errorResponse{}
-	response.Error.Code = code
-	response.Error.Message = message
-	writeJSON(writer, status, response)
-}
-
-func writeJSON(writer http.ResponseWriter, status int, value any) {
-	encoded, _ := json.Marshal(value)
-	writer.Header().Set("Content-Type", "application/json")
-	writer.WriteHeader(status)
-	_, _ = writer.Write(append(encoded, '\n'))
 }
