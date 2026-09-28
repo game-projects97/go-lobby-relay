@@ -166,7 +166,7 @@ Ticket
   player_id
   queue_key
   capacity            2..16
-  state               queued | matched | cancelled | expired
+  state               queued | matched | cancelled | expired | released
   revision
   sequence            global FIFO order
   deadline            exact 2m
@@ -310,6 +310,14 @@ Returns caller ticket and caller-private assignment when matched.
 ```
 
 Returns cancelled Ticket snapshot; matched ticket cancellation returns conflict.
+
+#### `POST /v1/matchmaking/tickets/me/release`
+
+```json
+{"revision":2}
+```
+
+Releases the caller's **matched** ticket so the player can queue or open a Lobby again (e.g. a rematch) before the match TTL ends. Returns the ticket snapshot with state `released` and no assignment. The Relay room and other participants' tickets and grants are untouched; the room still ends at its own deadline. A queued ticket, stale revision or missing ticket returns conflict / not found. ([ADR 0004](./decisions/0004-relay-carriers-and-match-ttl.md))
 
 ## 10. Server Composition and Lifecycle
 

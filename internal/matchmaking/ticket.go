@@ -20,6 +20,7 @@ const (
 	TicketStateMatched   TicketState = "matched"
 	TicketStateCancelled TicketState = "cancelled"
 	TicketStateExpired   TicketState = "expired"
+	TicketStateReleased  TicketState = "released"
 )
 
 type CreateTicketRequest struct {
@@ -126,6 +127,43 @@ func (manager *Manager) CancelTicket(playerID string, revision uint64) (TicketSn
 	delete(manager.ticketsByPlayer, playerID)
 	manager.removeQueuedPlayerLocked(queueBucket{queueKey: record.queueKey, capacity: record.capacity}, playerID)
 	return snapshot, nil
+}
+
+// ReleaseTicket frees a matched player to queue or host again while the match's
+// Relay room keeps running until its own deadline. The caller must already hold
+// its assignment; other participants' tickets are unaffected.
+func (manager *Manager) ReleaseTicket(playerID string, revision uint64) (TicketSnapshot, error) {
+	if !protocol.ValidID(playerID) || revision == 0 {
+		return TicketSnapshot{}, ErrInvalid
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	manager.expireLocked(manager.now())
+	record := manager.ticketsByPlayer[playerID]
+	if record == nil {
+		return TicketSnapshot{}, ErrNotFound
+	}
+	if record.state != TicketStateMatched || record.assignment == nil || record.revision != revision || record.revision == math.MaxUint64 {
+		return TicketSnapshot{}, ErrConflict
+	}
+	record.state = TicketStateReleased
+	record.revision++
+	snapshot := ticketSnapshot(record)
+	snapshot.Assignment = nil
+	delete(manager.ticketsByPlayer, playerID)
+	if !manager.matchReferencedLocked(record.assignment.MatchID) {
+		delete(manager.matchIDs, record.assignment.MatchID)
+	}
+	return snapshot, nil
+}
+
+func (manager *Manager) matchReferencedLocked(matchID string) bool {
+	for _, ticket := range manager.ticketsByPlayer {
+		if ticket.assignment != nil && ticket.assignment.MatchID == matchID {
+			return true
+		}
+	}
+	return false
 }
 
 func validCreateTicketRequest(request CreateTicketRequest) bool {
