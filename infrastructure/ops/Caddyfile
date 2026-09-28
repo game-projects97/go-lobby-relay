@@ -2,7 +2,15 @@
 # API_HOSTNAME comes from /etc/lobby-relay/server.env via caddy-lobby-relay.conf.
 # Caddy obtains and renews the certificate itself (ports 80 and 443 must be open).
 {$API_HOSTNAME} {
+	# WebSocket Relay carrier for browsers/WebViews (wss://API_HOSTNAME/v1/relay).
+	# Caddy proxies the Upgrade itself; Host and Origin pass through unchanged,
+	# so the Go server's same-host origin check still applies.
+	handle /v1/relay {
+		reverse_proxy 127.0.0.1:8082
+	}
 	# Player API only. The operator API (127.0.0.1:8081) is never proxied.
 	# Body size, auth and admission limits are enforced by the Go server (HTTP 413/401/429).
-	reverse_proxy 127.0.0.1:8080
+	handle {
+		reverse_proxy 127.0.0.1:8080
+	}
 }

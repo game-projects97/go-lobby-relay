@@ -12,6 +12,7 @@ infrastructure/
 | 경로 | 외부 노출 | 수신 위치 |
 |---|---|---|
 | Player HTTP API | HTTPS 443 (Caddy가 Let's Encrypt 인증서 자동 발급·갱신) | `127.0.0.1:8080` |
+| WebSocket Relay (`/v1/relay`) | WSS 443 (같은 Caddy 사이트) | `127.0.0.1:8082` |
 | UDP Relay | 공개 UDP 한 포트 | `0.0.0.0:<RELAY_UDP_PORT>` |
 | Operator HTTP API | 없음 | `127.0.0.1:8081` |
 | SSH | 관리자 IPv4 `/32`만 | `:22` |

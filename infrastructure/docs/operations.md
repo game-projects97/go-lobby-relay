@@ -8,6 +8,7 @@
 
 - **Player HTTP** `127.0.0.1:8080`: Caddy가 `API_HOSTNAME`의 443에서 TLS를 종료하고 이 주소로만 전달한다. 앱은 `https://API_HOSTNAME/v1/...`로 접속한다. player API 응답에는 `grant_secret`이 들어 있으므로 평문 HTTP로 공개하지 않는다.
 - **Operator HTTP** `127.0.0.1:8081`: 외부에 열지 않고 Caddy도 전달하지 않는다. Player Token 발급과 room 할당은 같은 호스트의 신뢰된 백엔드나 SSH에서 호출한다.
+- **WebSocket Relay** `127.0.0.1:8082`: UDP를 열 수 없는 브라우저·WebView용 carrier(ADR 0004). Caddy가 같은 사이트의 `/v1/relay`만 이 주소로 전달하므로 클라이언트는 `wss://API_HOSTNAME/v1/relay`(subprotocol `relay.v1`)로 접속한다. 이 주소는 assignment에 담기지 않으므로 클라이언트 설정에 넣는다. 프록시 뒤에서는 모든 WebSocket 클라이언트의 peer IP가 `127.0.0.1`이 되므로 (1) 동시 WebSocket 연결은 per-source 상한의 최대치인 256개로 제한되고 (2) pre-auth(handshake) 속도 예산을 모든 웹 클라이언트가 함께 쓴다. 다른 origin에서 서비스하는 웹 클라이언트를 허용하려면 유닛의 `ExecStart`에 `--relay-ws-allowed-origin HOST`를 추가한다(같은 호스트 origin과 Origin 헤더가 없는 네이티브 클라이언트는 기본 허용). 배포 시 Caddy reload와 서버 재시작이 열린 WebSocket을 끊는데, relay 상태는 어차피 메모리에만 있다.
 - **UDP Relay** `0.0.0.0:RELAY_UDP_PORT`: 공개한다. grant에는 `RELAY_ADVERTISED_HOST`를 담는다. 서버가 한 대이므로 `API_HOSTNAME`과 같은 이름을 써도 된다.
 - **SSH**: 관리자 고정 IPv4 `/32`에서만 허용하고, 비밀번호 로그인은 끈다.
 

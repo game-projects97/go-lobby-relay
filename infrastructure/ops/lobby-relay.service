@@ -15,8 +15,10 @@ EnvironmentFile=/etc/lobby-relay/server.env
 EnvironmentFile=/etc/lobby-relay/traffic.env
 # Public UDP reaches this process directly, so it is gated on transfer accounting.
 ExecStartPre=+/opt/lobby-relay/ops/check-traffic-budget.sh --check-start
-# Both HTTP listeners stay on loopback; Caddy terminates TLS for the player API.
-ExecStart=/opt/lobby-relay/current/lobby-relay --management-listen 127.0.0.1:8081 --player-listen 127.0.0.1:8080 --relay-network udp4 --relay-listen 0.0.0.0:${RELAY_UDP_PORT} --advertised-host ${RELAY_ADVERTISED_HOST} --advertised-port ${RELAY_UDP_PORT} --operator-token-file /etc/lobby-relay/operator-token
+# All HTTP listeners stay on loopback; Caddy terminates TLS for the player API and
+# the WebSocket Relay. Every WebSocket client then arrives from 127.0.0.1, so the
+# per-source cap is raised to its hard maximum (256), which bounds web clients.
+ExecStart=/opt/lobby-relay/current/lobby-relay --management-listen 127.0.0.1:8081 --player-listen 127.0.0.1:8080 --relay-ws-listen 127.0.0.1:8082 --relay-ws-max-per-source 256 --relay-network udp4 --relay-listen 0.0.0.0:${RELAY_UDP_PORT} --advertised-host ${RELAY_ADVERTISED_HOST} --advertised-port ${RELAY_UDP_PORT} --operator-token-file /etc/lobby-relay/operator-token
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
