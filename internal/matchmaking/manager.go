@@ -19,6 +19,7 @@ const (
 	HardMaxListPage    = 50
 	DefaultLobbyTTL    = 30 * time.Minute
 	MatchTTL           = 2 * time.Minute
+	HardMaxMatchTTL    = relayroom.HardMaxRoomTTL
 
 	maxIDDraws = 9
 )
@@ -37,14 +38,18 @@ type Config struct {
 	Rooms  *relayroom.Store
 	Now    func() clock.Reading
 	Random io.Reader
+	// MatchTTL bounds a formed match's Relay room, grants and assignment.
+	// Zero selects MatchTTL; games whose rounds outlast it raise it up to HardMaxMatchTTL.
+	MatchTTL time.Duration
 }
 
 type Manager struct {
 	mu sync.Mutex
 
-	rooms  *relayroom.Store
-	now    func() clock.Reading
-	random io.Reader
+	rooms    *relayroom.Store
+	now      func() clock.Reading
+	random   io.Reader
+	matchTTL time.Duration
 
 	lobbiesByID     map[string]*lobbyRecord
 	lobbyByPlayer   map[string]string
@@ -55,8 +60,12 @@ type Manager struct {
 }
 
 func New(config Config) (*Manager, error) {
-	if config.Rooms == nil {
+	if config.Rooms == nil || config.MatchTTL < 0 || config.MatchTTL > HardMaxMatchTTL {
 		return nil, ErrInvalid
+	}
+	matchTTL := config.MatchTTL
+	if matchTTL == 0 {
+		matchTTL = MatchTTL
 	}
 	now := config.Now
 	if now == nil {
@@ -70,6 +79,7 @@ func New(config Config) (*Manager, error) {
 		rooms:           config.Rooms,
 		now:             now,
 		random:          random,
+		matchTTL:        matchTTL,
 		lobbiesByID:     make(map[string]*lobbyRecord),
 		lobbyByPlayer:   make(map[string]string),
 		matchIDs:        make(map[string]struct{}),

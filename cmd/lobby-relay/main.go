@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/gyungsubLee/go-lobby-relay/internal/app"
 	"github.com/gyungsubLee/go-lobby-relay/internal/httpapi/operatorapi"
@@ -35,6 +36,18 @@ func (value *requiredValue) Set(next string) error {
 	return nil
 }
 
+type originList []string
+
+func (list *originList) String() string { return "" }
+
+func (list *originList) Set(next string) error {
+	if next == "" {
+		return errStartup
+	}
+	*list = append(*list, next)
+	return nil
+}
+
 func parseConfig(args []string) (app.Config, error) {
 	for _, argument := range args {
 		if argument == "--" || strings.HasPrefix(argument, "-") && !strings.HasPrefix(argument, "--") {
@@ -52,6 +65,13 @@ func parseConfig(args []string) (app.Config, error) {
 	flags.Var(&advertisedHost, "advertised-host", "")
 	flags.Var(&advertisedPort, "advertised-port", "")
 	flags.Var(&operatorTokenFile, "operator-token-file", "")
+	// Optional: WebSocket Relay carrier for browser/WebView clients and match lifetime.
+	var wsListen, wsMaxPerSource, matchTTL requiredValue
+	var wsOrigins originList
+	flags.Var(&wsListen, "relay-ws-listen", "")
+	flags.Var(&wsOrigins, "relay-ws-allowed-origin", "")
+	flags.Var(&wsMaxPerSource, "relay-ws-max-per-source", "")
+	flags.Var(&matchTTL, "match-ttl", "")
 	values := []*requiredValue{
 		&operatorListen, &playerListen, &relayNetwork, &relayListen,
 		&advertisedHost, &advertisedPort, &operatorTokenFile,
@@ -75,14 +95,38 @@ func parseConfig(args []string) (app.Config, error) {
 	if err != nil {
 		return app.Config{}, errStartup
 	}
+	for _, value := range []*requiredValue{&wsListen, &wsMaxPerSource, &matchTTL} {
+		if value.set && value.value == "" {
+			return app.Config{}, errStartup
+		}
+	}
+	var maxPerSource int
+	if wsMaxPerSource.set {
+		parsed, err := strconv.ParseUint(wsMaxPerSource.value, 10, 16)
+		if err != nil || parsed == 0 {
+			return app.Config{}, errStartup
+		}
+		maxPerSource = int(parsed)
+	}
+	var ttl time.Duration
+	if matchTTL.set {
+		ttl, err = time.ParseDuration(matchTTL.value)
+		if err != nil || ttl <= 0 {
+			return app.Config{}, errStartup
+		}
+	}
 	return app.Config{
-		OperatorListen: operatorListen.value,
-		PlayerListen:   playerListen.value,
-		RelayNetwork:   relayNetwork.value,
-		RelayListen:    relayListen.value,
-		AdvertisedHost: advertisedHost.value,
-		AdvertisedPort: uint16(port),
-		OperatorToken:  token,
+		MatchTTL:                ttl,
+		WebSocketListen:         wsListen.value,
+		WebSocketAllowedOrigins: wsOrigins,
+		WebSocketMaxPerSource:   maxPerSource,
+		OperatorListen:          operatorListen.value,
+		PlayerListen:            playerListen.value,
+		RelayNetwork:            relayNetwork.value,
+		RelayListen:             relayListen.value,
+		AdvertisedHost:          advertisedHost.value,
+		AdvertisedPort:          uint16(port),
+		OperatorToken:           token,
 	}, nil
 }
 
