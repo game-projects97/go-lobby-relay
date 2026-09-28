@@ -375,7 +375,8 @@ func allowAtomic(now time.Time, charges ...limiterCharge) bool {
 }
 
 func sourceKey(endpoint netip.AddrPort) netip.Prefix {
-	address := endpoint.Addr().Unmap()
+	// Stream carriers tag endpoints with a zone; budgets follow the peer address.
+	address := endpoint.Addr().WithZone("").Unmap()
 	if address.Is4() {
 		return netip.PrefixFrom(address, 32)
 	}

@@ -288,3 +288,26 @@ func decode(t *testing.T, response *httptest.ResponseRecorder, target any) {
 		t.Fatalf("decode %q: %v", response.Body.String(), err)
 	}
 }
+
+func TestReleaseMatchedTicketRoute(t *testing.T) {
+	fixture := newFixture(t)
+	a := fixture.token(t, "player-a")
+	b := fixture.token(t, "player-b")
+	assertStatus(t, fixture.request(t, a, http.MethodPost, "/v1/matchmaking/tickets", `{"queue_key":"duo","capacity":2}`), http.StatusCreated)
+	assertStatus(t, fixture.request(t, b, http.MethodPost, "/v1/matchmaking/tickets", `{"queue_key":"duo","capacity":2}`), http.StatusCreated)
+
+	var matched decodedTicket
+	decode(t, fixture.request(t, a, http.MethodGet, "/v1/matchmaking/tickets/me", ""), &matched)
+	assertStatus(t, fixture.request(t, a, http.MethodGet, "/v1/matchmaking/tickets/me/release", ""), http.StatusMethodNotAllowed)
+	assertStatus(t, fixture.request(t, a, http.MethodPost, "/v1/matchmaking/tickets/me/release", fmt.Sprintf(`{"revision":%d}`, matched.Revision+1)), http.StatusConflict)
+
+	released := fixture.request(t, a, http.MethodPost, "/v1/matchmaking/tickets/me/release", fmt.Sprintf(`{"revision":%d}`, matched.Revision))
+	assertStatus(t, released, http.StatusOK)
+	var releasedTicket decodedTicket
+	decode(t, released, &releasedTicket)
+	if releasedTicket.State != "released" || releasedTicket.Assignment != nil {
+		t.Fatalf("released ticket = %+v", releasedTicket)
+	}
+	assertStatus(t, fixture.request(t, a, http.MethodGet, "/v1/matchmaking/tickets/me", ""), http.StatusNotFound)
+	assertStatus(t, fixture.request(t, a, http.MethodPost, "/v1/matchmaking/tickets", `{"queue_key":"duo","capacity":2}`), http.StatusCreated)
+}
