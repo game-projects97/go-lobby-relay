@@ -48,7 +48,7 @@ M1은 한 Go process와 in-memory state만 사용한다. Redis, database, Kubern
 - reliable/ordered gameplay delivery, ACK/retry/offline buffering
 - persistence, restart recovery, multi-process ownership, horizontal scaling
 - Steamworks/FishNet/Open Match runtime의 M1 직접 통합
-- WebGL/WebSocket/WebRTC, P2P hole punching, STUN/TURN/ICE
+- WebGL/WebRTC, P2P hole punching, STUN/TURN/ICE (WebSocket Relay carrier는 [ADR 0004](./decisions/0004-relay-carriers-and-match-ttl.md)로 선택 기능이 되었다)
 - fixed Unity version 또는 physical device를 backend M1의 선행 조건으로 지정
 
 ## 5. 사용자와 핵심 흐름
@@ -144,7 +144,9 @@ The authoritative 37-requirement registry is [REQUIREMENTS.md](../.planning/REQU
 | Lobby TTL | default 30 minutes, maximum 2 hours |
 | Public list page | 50 |
 | Live Quick Match tickets | 4096 |
-| Ticket/assignment/Relay match TTL | 2 minutes |
+| Ticket TTL | 2 minutes |
+| Assignment/Relay match TTL | default 2 minutes, `--match-ttl` maximum 2 hours |
+| WebSocket carrier connections | 1024, per peer IP default 16 (`--relay-ws-max-per-source`) |
 | Player active ownership | one open Lobby or one live ticket |
 | Relay datagram / opaque payload | 1200 / 900 bytes |
 | Existing Relay rooms / sessions | 256 / 4096 |

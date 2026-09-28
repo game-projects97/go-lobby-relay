@@ -106,6 +106,11 @@ func (handler *handler) route(writer http.ResponseWriter, request *http.Request,
 	case "/v1/matchmaking/tickets/me":
 		handler.handleMyTicket(writer, request, playerID)
 		return
+	case "/v1/matchmaking/tickets/me/release":
+		handler.handleRevisionAction(writer, request, http.MethodPost, func(revision uint64) (any, error) {
+			return handler.lobbies.ReleaseTicket(playerID, revision)
+		})
+		return
 	}
 	const prefix = "/v1/lobbies/"
 	if !strings.HasPrefix(request.URL.Path, prefix) {
@@ -295,6 +300,8 @@ func (handler *handler) encodeActionResult(value any) any {
 		return encodeLobby(typed, handler.advertisedHost, handler.advertisedPort)
 	case matchmaking.Assignment:
 		return encodeAssignment(typed, handler.advertisedHost, handler.advertisedPort)
+	case matchmaking.TicketSnapshot:
+		return encodeTicket(typed, handler.advertisedHost, handler.advertisedPort)
 	default:
 		return value
 	}

@@ -24,8 +24,8 @@ type matchAllocation struct {
 }
 
 func (manager *Manager) allocateMatchLocked(players []string, reading clock.Reading) (matchAllocation, error) {
-	expiresAt := reading.Wall.UTC().Add(MatchTTL)
-	deadline, ok := clock.DeadlineAfter(reading.Mono, MatchTTL)
+	expiresAt := reading.Wall.UTC().Add(manager.matchTTL)
+	deadline, ok := clock.DeadlineAfter(reading.Mono, manager.matchTTL)
 	if !ok {
 		return matchAllocation{}, ErrUnavailable
 	}

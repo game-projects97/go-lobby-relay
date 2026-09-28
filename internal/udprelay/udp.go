@@ -11,6 +11,7 @@ import (
 	relayv1 "github.com/gyungsubLee/go-lobby-relay/gen/go/relay/v1"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
 	"github.com/gyungsubLee/go-lobby-relay/internal/relayroom"
+	"github.com/gyungsubLee/go-lobby-relay/internal/relaytransport"
 )
 
 const (
@@ -24,6 +25,7 @@ var (
 	errClose         = errors.New("udprelay: socket close failed")
 	errAlreadyRun    = errors.New("udprelay: already running")
 	errInternal      = errors.New("udprelay: internal failure")
+	errTransportDrop = errors.New("udprelay: transport dropped datagram")
 )
 
 type udpSocket interface {
@@ -36,6 +38,9 @@ type udpSocket interface {
 type Config struct {
 	WriteTimeout time.Duration
 	Now          func() time.Time
+	// Transports carry endpoints that are not UDP. Their datagrams enter via
+	// Deliver and share the same admission, room and fan-out policy.
+	Transports []relaytransport.Transport
 }
 
 type DropReasons struct {
@@ -70,6 +75,7 @@ type Server struct {
 	rooms        *relayroom.Store
 	writeTimeout time.Duration
 	now          func() time.Time
+	transports   []relaytransport.Transport
 
 	closed    atomic.Bool
 	closeOnce sync.Once
@@ -91,7 +97,41 @@ func New(socket udpSocket, rooms *relayroom.Store, config Config) (*Server, erro
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	return &Server{socket: socket, rooms: rooms, writeTimeout: config.WriteTimeout, now: config.Now}, nil
+	for _, transport := range config.Transports {
+		if transport == nil || reflect.ValueOf(transport).Kind() == reflect.Pointer && reflect.ValueOf(transport).IsNil() {
+			return nil, errInvalidConfig
+		}
+	}
+	return &Server{
+		socket: socket, rooms: rooms, writeTimeout: config.WriteTimeout, now: config.Now,
+		transports: append([]relaytransport.Transport(nil), config.Transports...),
+	}, nil
+}
+
+// Deliver admits one datagram that a registered Transport received from an
+// endpoint it owns. It is safe for concurrent use with Run. A non-nil error is
+// fatal for the Relay, as it is for Run.
+func (relay *Server) Deliver(datagram []byte, endpoint netip.AddrPort) error {
+	if relay.closed.Load() {
+		return nil
+	}
+	if len(datagram) > protocol.MaxDatagramBytes+1 {
+		datagram = datagram[:protocol.MaxDatagramBytes+1]
+	}
+	if relay.transportFor(endpoint) == nil {
+		relay.recordReceivedDrop(relayroom.RejectWrongEndpoint)
+		return nil
+	}
+	return relay.handleDatagram(datagram, endpoint)
+}
+
+func (relay *Server) transportFor(endpoint netip.AddrPort) relaytransport.Transport {
+	for _, transport := range relay.transports {
+		if transport.Owns(endpoint) {
+			return transport
+		}
+	}
+	return nil
 }
 
 func nilSocket(socket udpSocket) bool {
@@ -130,6 +170,10 @@ func (relay *Server) Run() error {
 		if read < 0 || read > len(buffer) {
 			return errRead
 		}
+		if relay.transportFor(endpoint) != nil {
+			relay.recordReceivedDrop(relayroom.RejectWrongEndpoint)
+			continue
+		}
 		endpoint = normalizeEndpoint(endpoint)
 		if err := relay.handleDatagram(buffer[:read], endpoint); err != nil {
 			return err
@@ -160,8 +204,17 @@ func (relay *Server) Counters() Counters {
 	return relay.counters
 }
 
+func (relay *Server) recordReceivedDrop(reason relayroom.RejectReason) {
+	relay.countersMu.Lock()
+	relay.counters.UDPReceived++
+	relay.countersMu.Unlock()
+	relay.recordDrop(reason)
+}
+
 func (relay *Server) handleDatagram(datagram []byte, endpoint netip.AddrPort) error {
-	endpoint = normalizeEndpoint(endpoint)
+	if relay.transportFor(endpoint) == nil {
+		endpoint = normalizeEndpoint(endpoint)
+	}
 	relay.countersMu.Lock()
 	relay.counters.UDPReceived++
 	relay.countersMu.Unlock()
@@ -294,6 +347,10 @@ func (relay *Server) reject(reason relayroom.RejectReason) error {
 }
 
 func (relay *Server) writeOne(datagram []byte, endpoint netip.AddrPort) {
+	if transport := relay.transportFor(endpoint); transport != nil {
+		transport.Send(datagram, endpoint)
+		return
+	}
 	if relay.socket.SetWriteDeadline(relay.now().Add(relay.writeTimeout)) != nil {
 		return
 	}
@@ -301,18 +358,40 @@ func (relay *Server) writeOne(datagram []byte, endpoint netip.AddrPort) {
 }
 
 func (relay *Server) writeFanout(datagram []byte, recipients []netip.AddrPort) {
-	if len(recipients) == 0 || relay.socket.SetWriteDeadline(relay.now().Add(relay.writeTimeout)) != nil {
+	if len(recipients) == 0 {
 		return
 	}
+	deadlineSet := false
 	for _, recipient := range recipients {
+		transport := relay.transportFor(recipient)
+		if transport == nil && !deadlineSet {
+			if relay.socket.SetWriteDeadline(relay.now().Add(relay.writeTimeout)) != nil {
+				return
+			}
+			deadlineSet = true
+		}
 		relay.countersMu.Lock()
 		relay.counters.FanoutWriteAttempts++
 		relay.countersMu.Unlock()
-		written, err := relay.socket.WriteToUDPAddrPort(datagram, recipient)
+		var written int
+		var err error
+		if transport != nil {
+			if transport.Send(datagram, recipient) {
+				written = len(datagram)
+			} else {
+				err = errTransportDrop
+			}
+		} else {
+			written, err = relay.socket.WriteToUDPAddrPort(datagram, recipient)
+		}
 		relay.countersMu.Lock()
 		if err != nil || written != len(datagram) {
 			relay.counters.FanoutWriteErrors++
 			relay.countersMu.Unlock()
+			if transport != nil {
+				// A full carrier queue drops only its own recipient.
+				continue
+			}
 			return
 		}
 		relay.counters.FanoutWriteSuccesses++

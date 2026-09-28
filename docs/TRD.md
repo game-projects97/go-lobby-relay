@@ -34,6 +34,7 @@ Production direct modules remain:
 ```text
 google.golang.org/protobuf v1.36.11
 golang.org/x/time v0.15.0
+github.com/coder/websocket v1.8.15   # optional WebSocket carrier, ADR 0004
 ```
 
 New code uses only Go standard library packages including `crypto/hmac`, `crypto/sha256`, `crypto/rand`, `encoding/base64`, `encoding/binary`, `encoding/json`, `net/http`, `sort`, `sync` and `time`.
@@ -45,6 +46,8 @@ flowchart LR
     O["Operator / future identity adapter"] -->|"private HTTP + operator Bearer"| OH["Operator listener"]
     P["Game clients"] -->|"HTTP + Player Token"| PH["Player listener"]
     P <-->|"relay.v1 UDP"| U["UDP Relay"]
+    B["Browser / WebView clients"] <-->|"relay.v1 over WebSocket (optional)"| W["WebSocket carrier"]
+    W -->|"Deliver / Send"| U
     OH --> A["Player Auth"]
     OH --> R["Relay Store"]
     PH --> L["Lobby Manager"]
@@ -163,7 +166,7 @@ Ticket
   player_id
   queue_key
   capacity            2..16
-  state               queued | matched | cancelled | expired
+  state               queued | matched | cancelled | expired | released
   revision
   sequence            global FIFO order
   deadline            exact 2m
@@ -308,6 +311,14 @@ Returns caller ticket and caller-private assignment when matched.
 
 Returns cancelled Ticket snapshot; matched ticket cancellation returns conflict.
 
+#### `POST /v1/matchmaking/tickets/me/release`
+
+```json
+{"revision":2}
+```
+
+Releases the caller's **matched** ticket so the player can queue or open a Lobby again (e.g. a rematch) before the match TTL ends. Returns the ticket snapshot with state `released` and no assignment. The Relay room and other participants' tickets and grants are untouched; the room still ends at its own deadline. A queued ticket, stale revision or missing ticket returns conflict / not found. ([ADR 0004](./decisions/0004-relay-carriers-and-match-ttl.md))
+
 ## 10. Server Composition and Lifecycle
 
 Required CLI inputs:
@@ -321,6 +332,17 @@ Required CLI inputs:
 --advertised-port
 --operator-token-file
 ```
+
+Optional CLI inputs ([ADR 0004](./decisions/0004-relay-carriers-and-match-ttl.md)):
+
+```text
+--relay-ws-listen             enable the WebSocket Relay carrier (route /v1/relay, subprotocol relay.v1)
+--relay-ws-allowed-origin     cross-origin host pattern; repeatable; "*" rejected
+--relay-ws-max-per-source     per peer IP connection cap (default 16, max 256)
+--match-ttl                   formed match lifetime, Go duration (default 2m, max 2h)
+```
+
+WebSocket options without `--relay-ws-listen` are rejected. With the carrier enabled, the TCP listener binds after UDP and `Run` owns a fifth loop (the WebSocket `http.Server`); shutdown also closes live WebSockets with status 1001.
 
 `server.New` validates every value, derives Player Auth, and binds management TCP → player TCP → UDP. Failure closes already-bound listeners in reverse order. `New` starts no goroutine.
 

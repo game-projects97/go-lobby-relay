@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	relayv1 "github.com/gyungsubLee/go-lobby-relay/gen/go/relay/v1"
 	"github.com/gyungsubLee/go-lobby-relay/internal/protocol"
 	"google.golang.org/protobuf/proto"
@@ -466,7 +467,7 @@ func TestQueuedUnexpectedLoopFailureWinsLaterCancellation(t *testing.T) {
 	results <- server.classifyLoopResult(runContext, "sweeper", nil)
 	results <- server.classifyLoopResult(runContext, "player", net.ErrClosed)
 
-	err := coordinateLoopResults(runContext, server.closeSignal, make(chan struct{}), results, func() {})
+	err := coordinateLoopResults(runContext, server.closeSignal, make(chan struct{}), results, 4, func() {})
 	if err != errOwnedLoop {
 		t.Fatalf("queued unexpected result after cancellation = %v, want generic %v", err, errOwnedLoop)
 	}
@@ -665,6 +666,7 @@ func createRoom(t *testing.T, address string, token [32]byte, roomID string, par
 
 type allocatedClient struct {
 	conn                             *net.UDPConn
+	ws                               *websocket.Conn
 	roomID, sessionID, participantID string
 	bindingID                        protocol.Bytes16
 	key                              protocol.Bytes32
@@ -737,6 +739,14 @@ func (client *allocatedClient) sendData(t *testing.T, relayEndpoint netip.AddrPo
 
 func (client *allocatedClient) send(t *testing.T, endpoint netip.AddrPort, datagram []byte) {
 	t.Helper()
+	if client.ws != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := client.ws.Write(ctx, websocket.MessageBinary, datagram); err != nil {
+			t.Fatalf("websocket Write(): %v", err)
+		}
+		return
+	}
 	_ = client.conn.SetWriteDeadline(time.Now().Add(time.Second))
 	written, err := client.conn.WriteToUDPAddrPort(datagram, endpoint)
 	if err != nil || written != len(datagram) {
@@ -746,6 +756,19 @@ func (client *allocatedClient) send(t *testing.T, endpoint netip.AddrPort, datag
 
 func (client *allocatedClient) receive(t *testing.T) *relayv1.Envelope {
 	t.Helper()
+	if client.ws != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		kind, message, err := client.ws.Read(ctx)
+		if err != nil || kind != websocket.MessageBinary {
+			t.Fatalf("websocket Read() = %v, %v", kind, err)
+		}
+		envelope := new(relayv1.Envelope)
+		if err := proto.Unmarshal(message, envelope); err != nil {
+			t.Fatalf("proto.Unmarshal(): %v", err)
+		}
+		return envelope
+	}
 	_ = client.conn.SetReadDeadline(time.Now().Add(time.Second))
 	buffer := make([]byte, protocol.MaxDatagramBytes+1)
 	read, _, err := client.conn.ReadFromUDPAddrPort(buffer)

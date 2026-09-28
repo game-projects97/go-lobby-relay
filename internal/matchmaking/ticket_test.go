@@ -307,3 +307,51 @@ func fillRelayStore(t *testing.T, relayStore *relayroom.Store, now time.Time) {
 		t.Fatalf("Create occupied room: %v", err)
 	}
 }
+
+func TestReleaseMatchedTicketFreesPlayerAndKeepsRoom(t *testing.T) {
+	manager, relayStore, _ := newLobbyFixture(t)
+	if _, err := manager.CreateTicket("player-a", CreateTicketRequest{QueueKey: "duel", Capacity: 2}); err != nil {
+		t.Fatalf("CreateTicket(a): %v", err)
+	}
+	matchedB, err := manager.CreateTicket("player-b", CreateTicketRequest{QueueKey: "duel", Capacity: 2})
+	if err != nil || matchedB.Assignment == nil {
+		t.Fatalf("CreateTicket(b) = %#v, %v", matchedB, err)
+	}
+	matchedA, _ := manager.GetTicket("player-a")
+	queued, _ := manager.CreateTicket("player-c", CreateTicketRequest{QueueKey: "solo", Capacity: 2})
+
+	if _, err := manager.ReleaseTicket("player-c", queued.Revision); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Release queued = %v, want conflict", err)
+	}
+	if _, err := manager.ReleaseTicket("player-a", matchedA.Revision+1); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale Release = %v, want conflict", err)
+	}
+	if _, err := manager.ReleaseTicket("player-z", 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Release missing = %v, want not found", err)
+	}
+	released, err := manager.ReleaseTicket("player-a", matchedA.Revision)
+	if err != nil || released.State != TicketStateReleased || released.Revision != matchedA.Revision+1 || released.Assignment != nil {
+		t.Fatalf("Release = %#v, %v", released, err)
+	}
+	if _, err := manager.GetTicket("player-a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get released = %v, want not found", err)
+	}
+	if again, err := manager.CreateTicket("player-a", CreateTicketRequest{QueueKey: "duel", Capacity: 2}); err != nil || again.State != TicketStateQueued {
+		t.Fatalf("requeue after release = %#v, %v", again, err)
+	}
+	if other, err := manager.GetTicket("player-b"); err != nil || other.Assignment == nil {
+		t.Fatalf("other participant = %#v, %v", other, err)
+	}
+	if room, err := relayStore.GetRoom(matchedB.Assignment.RoomID); err != nil || room.Participants[0].GrantState == relayroom.GrantStateRevoked {
+		t.Fatalf("room after release = %#v, %v", room, err)
+	}
+	if _, tracked := manager.matchIDs[matchedB.Assignment.MatchID]; !tracked {
+		t.Fatal("match ID dropped while player-b still references it")
+	}
+	if _, err := manager.ReleaseTicket("player-b", matchedB.Revision); err != nil {
+		t.Fatalf("Release b: %v", err)
+	}
+	if _, tracked := manager.matchIDs[matchedB.Assignment.MatchID]; tracked {
+		t.Fatal("match ID leaked after every participant released")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -14,7 +15,9 @@ import (
 	"github.com/gyungsubLee/go-lobby-relay/internal/matchmaking"
 	"github.com/gyungsubLee/go-lobby-relay/internal/playerauth"
 	"github.com/gyungsubLee/go-lobby-relay/internal/relayroom"
+	"github.com/gyungsubLee/go-lobby-relay/internal/relaytransport"
 	"github.com/gyungsubLee/go-lobby-relay/internal/udprelay"
+	"github.com/gyungsubLee/go-lobby-relay/internal/wsrelay"
 )
 
 var (
@@ -33,6 +36,13 @@ type Config struct {
 	AdvertisedHost string
 	AdvertisedPort uint16
 	OperatorToken  [32]byte
+
+	// MatchTTL bounds formed matches; zero keeps matchmaking.MatchTTL.
+	MatchTTL time.Duration
+	// WebSocketListen enables the WebSocket Relay carrier when non-empty.
+	WebSocketListen         string
+	WebSocketAllowedOrigins []string
+	WebSocketMaxPerSource   int
 }
 
 type dependencies struct {
@@ -52,6 +62,10 @@ type Server struct {
 	playerListener   net.Listener
 	playerServer     *http.Server
 	udpRelay         *udprelay.Server
+	wsListener       net.Listener
+	wsServer         *http.Server
+	wsRelay          *wsrelay.Server
+	wsAddr           net.Addr
 	rooms            *relayroom.Store
 	lobbies          *matchmaking.Manager
 	operatorAddr     net.Addr
@@ -87,7 +101,7 @@ func newWithDependencies(config Config, deps dependencies) (*Server, error) {
 	if err != nil {
 		return nil, errInvalidConfig
 	}
-	lobbies, err := matchmaking.New(matchmaking.Config{Rooms: rooms, Random: deps.random})
+	lobbies, err := matchmaking.New(matchmaking.Config{Rooms: rooms, Random: deps.random, MatchTTL: config.MatchTTL})
 	if err != nil {
 		return nil, errInvalidConfig
 	}
@@ -106,12 +120,25 @@ func newWithDependencies(config Config, deps dependencies) (*Server, error) {
 		_ = operatorListener.Close()
 		return nil, errBind
 	}
+	var wsListener net.Listener
+	if config.WebSocketListen != "" {
+		wsListener, err = deps.listenTCP("tcp", config.WebSocketListen)
+		if err != nil {
+			_ = relaySocket.Close()
+			_ = playerListener.Close()
+			_ = operatorListener.Close()
+			return nil, errBind
+		}
+	}
 	cleanup := true
 	defer func() {
 		if cleanup {
 			_ = operatorListener.Close()
 			_ = playerListener.Close()
 			_ = relaySocket.Close()
+			if wsListener != nil {
+				_ = wsListener.Close()
+			}
 		}
 	}()
 
@@ -151,9 +178,29 @@ func newWithDependencies(config Config, deps dependencies) (*Server, error) {
 	if err != nil {
 		return nil, errInvalidConfig
 	}
-	udpRelay, err := udprelay.New(relaySocket, rooms, udprelay.Config{})
+	var udpRelay *udprelay.Server
+	var transports []relaytransport.Transport
+	if wsListener != nil {
+		server.wsRelay, err = wsrelay.New(wsrelay.Config{
+			// Messages arrive only after Run, by which time udpRelay is set.
+			Deliver:        func(datagram []byte, endpoint netip.AddrPort) error { return udpRelay.Deliver(datagram, endpoint) },
+			AllowedOrigins: config.WebSocketAllowedOrigins,
+			MaxPerSource:   config.WebSocketMaxPerSource,
+			Fatal:          server.notifyFatal,
+		})
+		if err != nil {
+			return nil, errInvalidConfig
+		}
+		transports = append(transports, server.wsRelay)
+	}
+	udpRelay, err = udprelay.New(relaySocket, rooms, udprelay.Config{Transports: transports})
 	if err != nil {
 		return nil, errInvalidConfig
+	}
+	if wsListener != nil {
+		server.wsListener = wsListener
+		server.wsAddr = wsListener.Addr()
+		server.wsServer = wsrelay.NewHTTPServer(wsListener.Addr().String(), server.wsRelay)
 	}
 
 	server.operatorServer = operatorapi.NewServer(operatorListener.Addr().String(), handler)
@@ -174,6 +221,13 @@ func validateConfig(config Config) (*net.UDPAddr, error) {
 	if _, err := net.ResolveTCPAddr("tcp", config.PlayerListen); err != nil {
 		return nil, errInvalidConfig
 	}
+	if config.WebSocketListen != "" {
+		if _, err := net.ResolveTCPAddr("tcp", config.WebSocketListen); err != nil {
+			return nil, errInvalidConfig
+		}
+	} else if len(config.WebSocketAllowedOrigins) != 0 || config.WebSocketMaxPerSource != 0 {
+		return nil, errInvalidConfig
+	}
 	relayAddress, err := net.ResolveUDPAddr(config.RelayNetwork, config.RelayListen)
 	if err != nil || relayAddress == nil || (config.AdvertisedPort == 0 && relayAddress.Port != 0) {
 		return nil, errInvalidConfig
@@ -186,6 +240,16 @@ func (server *Server) OperatorAddr() net.Addr { return server.operatorAddr }
 func (server *Server) PlayerAddr() net.Addr { return server.playerAddr }
 
 func (server *Server) RelayAddr() net.Addr { return server.relayAddr }
+
+// WebSocketAddr is nil unless the WebSocket carrier is enabled.
+func (server *Server) WebSocketAddr() net.Addr { return server.wsAddr }
+
+func (server *Server) loopCount() int {
+	if server.wsServer != nil {
+		return 5
+	}
+	return 4
+}
 
 type loopResult struct {
 	name       string
@@ -210,7 +274,7 @@ func (server *Server) Run(ctx context.Context) error {
 	server.mu.Unlock()
 
 	runContext, cancel := context.WithCancel(ctx)
-	results := make(chan loopResult, 4)
+	results := make(chan loopResult, server.loopCount())
 	go func() {
 		err := server.operatorServer.Serve(server.operatorListener)
 		results <- server.classifyLoopResult(runContext, "operator", err)
@@ -223,12 +287,18 @@ func (server *Server) Run(ctx context.Context) error {
 		err := server.udpRelay.Run()
 		results <- server.classifyLoopResult(runContext, "relay", err)
 	}()
+	if server.wsServer != nil {
+		go func() {
+			err := server.wsServer.Serve(server.wsListener)
+			results <- server.classifyLoopResult(runContext, "websocket", err)
+		}()
+	}
 	go func() {
 		server.runSweeper(runContext)
 		results <- server.classifyLoopResult(runContext, "sweeper", nil)
 	}()
 
-	runErr := coordinateLoopResults(runContext, server.closeSignal, server.fatalSignal, results, func() {
+	runErr := coordinateLoopResults(runContext, server.closeSignal, server.fatalSignal, results, server.loopCount(), func() {
 		cancel()
 		_ = server.shutdown()
 	})
@@ -265,6 +335,7 @@ func coordinateLoopResults(
 	ctx context.Context,
 	closeSignal, fatalSignal <-chan struct{},
 	results <-chan loopResult,
+	loops int,
 	stop func(),
 ) error {
 	received := 0
@@ -279,7 +350,7 @@ func coordinateLoopResults(
 		unexpected = result.unexpected
 	}
 	stop()
-	for received < 4 {
+	for received < loops {
 		if (<-results).unexpected {
 			unexpected = true
 		}
@@ -320,10 +391,21 @@ func (server *Server) shutdown() error {
 		listenerErr := server.operatorListener.Close()
 		playerListenerErr := server.playerListener.Close()
 		relayErr := server.udpRelay.Close()
+		var wsErr error
+		if server.wsServer != nil {
+			// Hijacked WebSockets outlive http.Server.Close; the carrier ends them.
+			wsErr = server.wsServer.Close()
+			if errors.Is(wsErr, http.ErrServerClosed) || errors.Is(wsErr, net.ErrClosed) {
+				wsErr = nil
+			}
+			if server.wsRelay.Close() != nil {
+				wsErr = errClose
+			}
+		}
 		if operatorErr != nil && !errors.Is(operatorErr, http.ErrServerClosed) && !errors.Is(operatorErr, net.ErrClosed) ||
 			playerErr != nil && !errors.Is(playerErr, http.ErrServerClosed) && !errors.Is(playerErr, net.ErrClosed) ||
 			listenerErr != nil && !errors.Is(listenerErr, net.ErrClosed) ||
-			playerListenerErr != nil && !errors.Is(playerListenerErr, net.ErrClosed) || relayErr != nil {
+			playerListenerErr != nil && !errors.Is(playerListenerErr, net.ErrClosed) || relayErr != nil || wsErr != nil {
 			server.shutdownErr = errClose
 		}
 	})
