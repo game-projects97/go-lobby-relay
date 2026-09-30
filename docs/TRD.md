@@ -370,7 +370,7 @@ The following implemented properties remain unchanged:
 - pre-auth/session/room/process packet/byte limits and room/process fan-out limits
 - exact monotonic authority and bounded cleanup/tombstones
 
-References: [ADR 0001](./decisions/0001-m1-wire-and-threat-boundary.md), [ADR 0002](./decisions/0002-m1-control-lifecycle-policy.md), [ADR 0003](./decisions/0003-m1-udp-admission-and-fanout-policy.md).
+References: [ADR 0001](./decisions/0001-m1-wire-and-threat-boundary.md), [ADR 0002](./decisions/0002-m1-control-lifecycle-policy.md), [ADR 0003](./decisions/0003-m1-udp-admission-and-fanout-policy.md), [ADR 0004](./decisions/0004-relay-carriers-and-match-ttl.md).
 
 ## 12. Error, Privacy and Cleanup Invariants
 

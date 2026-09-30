@@ -1,6 +1,6 @@
 # ADR 0004: Pluggable Relay carriers (WebSocket) and configurable match TTL
 
-- **Status:** Proposed
+- **Status:** Accepted — 2026-09-30 (implemented in `81f28fe`, `233d21a`; Caddy TLS front in `8d80ece`)
 - **Date:** 2026-09-28
 - **Decision owners:** Product, Protocol/Security, Operations
 - **Supersedes:** the PRD §4 non-goal "WebGL/WebSocket/WebRTC" for the WebSocket carrier only
