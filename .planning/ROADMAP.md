@@ -125,7 +125,7 @@
 
 **Requirements:** UNITY-01, UNITY-02, UNITY-03
 
-**Status:** Not started — exact Unity/editor/device/network matrix intentionally undecided
+**Status:** Not started for UNITY-01~03 — exact Unity/editor/device/network matrix intentionally undecided. 첫 실제 client는 Unity가 아닌 [avoid-ball-multiplayer](https://github.com/game-projects97/avoid-ball-multiplayer) web race mode이며, [ADR 0004](../docs/decisions/0004-relay-carriers-and-match-ttl.md) WebSocket carrier로 Quick Match→Relay 경로를 사용한다. 이 연동은 UNITY requirement evidence로 계산하지 않는다.
 
 ### Phase 7: Single-Host Runtime Operations
 
@@ -149,7 +149,7 @@
 
 **Requirements:** SHIP-01, SHIP-02, SHIP-03
 
-**Status:** Not started
+**Status:** Not started — CI(`ci.yml`), 단일 Lightsail VM Terraform/systemd 배포 기반(`99e9242`, `6b1cdc6`)과 Caddy WebSocket TLS front(`8d80ece`)가 선행 작업으로 존재하지만 SHIP-01~03 evidence는 아직 없다.
 
 ### Phase 9: Failure Drills and Performance Evidence
 

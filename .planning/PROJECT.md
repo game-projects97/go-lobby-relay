@@ -35,7 +35,7 @@
 - Steamworks/FishNet/Open Match runtime의 M1 도입
 - skill rating, party, team, region, backfill, invite, chat, presence
 - Redis, persistence, multi-process state, Kubernetes, Agones
-- WebGL/WebSocket, reliable/ordered gameplay transport
+- WebGL/WebRTC, reliable/ordered gameplay transport (WebSocket Relay carrier는 [ADR 0004](../docs/decisions/0004-relay-carriers-and-match-ttl.md)로 선택 기능이 되었다)
 - 고정 Unity Editor patch나 실기기 지원 주장의 M1 선행 조건화
 
 ## Constraints
@@ -60,6 +60,7 @@
 | player와 operator HTTP listener 분리 | Accepted — 2026-08-20 |
 | Unity version/device matrix는 실제 client integration Phase에서 결정 | Accepted — 2026-08-20 |
 | Steamworks/FishNet/Open Match는 검증된 필요가 생길 때 adapter로 추가 | Deferred |
+| 브라우저 client용 WebSocket Relay carrier와 `--match-ttl`, matched ticket release ([ADR 0004](../docs/decisions/0004-relay-carriers-and-match-ttl.md)) | Accepted — 2026-09-30 |
 
 ## Context
 
@@ -67,7 +68,8 @@
 - Approved redesign: [Room/Lobby & Quick Match design](../docs/superpowers/specs/2026-08-20-room-lobby-quick-match-design.md)
 - Execution plan: [M1 implementation plan](../docs/superpowers/plans/2026-08-20-room-lobby-quick-match-m1.md)
 - Completion evidence: [Milestone 1](../docs/evidence/m1/milestone-1.md)
-- ADR 0001–0003 remain authoritative for the implemented Relay wire, lifecycle, and UDP admission contracts.
+- ADR 0001–0003 remain authoritative for the implemented Relay wire, lifecycle, and UDP admission contracts. ADR 0004 adds the optional WebSocket carrier behind the same Relay core.
+- First real client: [avoid-ball-multiplayer](https://github.com/game-projects97/avoid-ball-multiplayer) web race mode (TypeScript, Quick Match + WebSocket carrier).
 
 ---
-*Last updated: 2026-08-20 after verified M1 completion*
+*Last updated: 2026-09-30 after ADR 0004 acceptance and first web client integration*

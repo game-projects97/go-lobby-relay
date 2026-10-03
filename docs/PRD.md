@@ -222,6 +222,6 @@ No placeholder adapter or dependency is added in M1.
 
 - Requirement IDs and status are authoritative in `.planning/REQUIREMENTS.md`.
 - Phase ordering and milestone gates are authoritative in `.planning/ROADMAP.md`.
-- Phase 1–3 ADRs remain authoritative for existing Relay contracts.
+- Phase 1–3 ADRs remain authoritative for existing Relay contracts; ADR 0004 adds the optional WebSocket carrier and configurable match TTL on top of them.
 - Phase 4–5 implementation follows [the approved design](./superpowers/specs/2026-08-20-room-lobby-quick-match-design.md) and [execution plan](./superpowers/plans/2026-08-20-room-lobby-quick-match-m1.md).
 - Checkboxes change only after clean-candidate verification evidence exists.
